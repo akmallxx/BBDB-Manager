@@ -1,5 +1,6 @@
 {
-  "name": "react-example",
+  "name": "bbdb-manager",
+  "description": "BBDB Manager - Modern Beekeeper-like Database Studio",
   "private": true,
   "version": "0.0.0",
   "type": "module",

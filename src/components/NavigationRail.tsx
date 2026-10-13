@@ -1,5 +1,6 @@
 import { Monitor, Database, Code, History, Sun, Moon, Info, Unplug } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { APP_NAME } from '../lib/config';
 
 export type RailView = 'connections' | 'entities' | 'history';
 
@@ -30,6 +31,14 @@ export function NavigationRail({
     <aside className="w-12 h-screen bg-zinc-950 border-r border-zinc-800/80 flex flex-col items-center justify-between py-3 z-30 shrink-0 select-none">
       {/* Top Icons */}
       <div className="flex flex-col items-center gap-2 w-full">
+        {/* Brand App Logo */}
+        <div
+          title={APP_NAME}
+          className="w-8 h-8 rounded-lg flex items-center justify-center p-0.5 bg-zinc-900 border border-zinc-800 shadow-sm mb-1"
+        >
+          <img src="/logo.png" alt={APP_NAME} className="w-full h-full object-contain rounded" />
+        </div>
+
         {/* Connections View Button */}
         <button
           onClick={() => onViewChange('connections')}
@@ -122,7 +131,7 @@ export function NavigationRail({
 
         {/* App Info Tooltip trigger */}
         <div
-          title="Beekeeper Database Studio v1.0.0 (SQLite & JSON persistent)"
+          title={`${APP_NAME} v1.0.0`}
           className="w-8 h-8 rounded flex items-center justify-center text-zinc-600 hover:text-zinc-400 cursor-help"
         >
           <Info className="w-3.5 h-3.5" />

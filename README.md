@@ -1,11 +1,11 @@
-# Database Studio (Beekeeper-Like Web SQL Client)
+# BBDB Manager
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/akmallxx/beekeeper-like/master/public/vite.svg" width="80" height="80" alt="Database Studio Logo" />
+  <img src="./public/logo.png" width="100" height="100" alt="BBDB Manager Logo" style="border-radius: 18px;" />
 </p>
 
 <p align="center">
-  <b>A modern, lightweight, and fast web-based SQL database studio inspired by Beekeeper Studio.</b>
+  <b>A modern, lightweight, and fast database management studio inspired by Beekeeper Studio.</b>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 
 ## 🌟 Overview
 
-**Database Studio** is an open-source web application designed for developers and database administrators who need a clean, responsive, and intuitive interface to query, inspect, and manage databases. Inspired by the sleek aesthetics and ergonomics of Beekeeper Studio, it brings desktop-grade database management straight to your browser.
+**BBDB Manager** is an open-source database management tool designed for developers and database administrators who need a clean, responsive, and intuitive interface to query, inspect, and manage databases. Inspired by the sleek aesthetics and ergonomics of Beekeeper Studio, it brings desktop-grade database management straight to your workflow. The project name and appearance can easily be customized via `.env`.
 
 ---
 

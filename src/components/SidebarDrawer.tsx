@@ -8,6 +8,7 @@ import { cn, formatRelativeTime, triggerDownload } from '../lib/utils';
 import { RailView } from './NavigationRail';
 import { TableDdlModal } from './TableDdlModal';
 import { useToast } from './ui/toast';
+import { APP_NAME } from '../lib/config';
 
 interface SidebarDrawerProps {
   currentView: RailView;
@@ -255,6 +256,12 @@ export function SidebarDrawer({
         <div className="flex flex-col h-full">
           {/* Top Button & Filter */}
           <div className="p-3 border-b border-zinc-800/80 space-y-2">
+            {/* App Brand Header */}
+            <div className="flex items-center gap-2 px-0.5 pb-1">
+              <img src="/logo.png" alt={APP_NAME} className="w-5 h-5 rounded object-contain shadow-xs" />
+              <span className="text-xs font-semibold font-mono tracking-wider text-zinc-200">{APP_NAME}</span>
+            </div>
+
             <button
               onClick={onNewConnectionClick}
               className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700/80 text-zinc-100 text-xs font-medium border border-zinc-700/50 transition-colors shadow-sm cursor-pointer"

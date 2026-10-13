@@ -8,9 +8,14 @@ import { DataTableView } from './components/DataTableView';
 import { SqlEditorView } from './components/SqlEditorView';
 import { TransactionLogModal } from './components/TransactionLogModal';
 import { ToastProvider, useToast } from './components/ui/toast';
+import { APP_NAME } from './lib/config';
 
 function AppContent() {
   const { success, error, info } = useToast();
+
+  useEffect(() => {
+    document.title = APP_NAME;
+  }, []);
 
   // Navigation rail view
   const [railView, setRailView] = useState<RailView>('connections');
