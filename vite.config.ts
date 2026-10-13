@@ -12,6 +12,7 @@ export default defineConfig(({ mode }) => {
     define: {
       'import.meta.env.VITE_APP_NAME': JSON.stringify(appName),
       '__APP_NAME__': JSON.stringify(appName),
+      '__API_PORT__': JSON.stringify(env.PORT || '3000'),
     },
     resolve: {
       alias: {
