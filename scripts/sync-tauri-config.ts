@@ -32,7 +32,7 @@ if (fs.existsSync(tauriConfPath)) {
   }
 }
 
-tauriConf.$schema = 'https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json';
+tauriConf.$schema = 'https://schema.tauri.app/config/2';
 tauriConf.productName = appName;
 tauriConf.version = version;
 tauriConf.identifier = identifier;
