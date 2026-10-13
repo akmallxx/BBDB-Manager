@@ -13,9 +13,9 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "tauri:sync": "tsx scripts/sync-tauri-config.ts",
-    "tauri": "tsx scripts/sync-tauri-config.ts && tauri",
-    "desktop:dev": "tsx scripts/sync-tauri-config.ts && tauri dev",
-    "desktop:build": "tsx scripts/sync-tauri-config.ts && tauri build"
+    "tauri": "tsx scripts/sync-tauri-config.ts && export PATH=\"$HOME/.cargo/bin:$PATH\" && tauri",
+    "desktop:dev": "tsx scripts/sync-tauri-config.ts && export PATH=\"$HOME/.cargo/bin:$PATH\" && tauri dev",
+    "desktop:build": "tsx scripts/sync-tauri-config.ts && export PATH=\"$HOME/.cargo/bin:$PATH\" && tauri build"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
