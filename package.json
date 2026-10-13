@@ -11,7 +11,11 @@
     "start": "tsx server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "tauri:sync": "tsx scripts/sync-tauri-config.ts",
+    "tauri": "tsx scripts/sync-tauri-config.ts && tauri",
+    "desktop:dev": "tsx scripts/sync-tauri-config.ts && tauri dev",
+    "desktop:build": "tsx scripts/sync-tauri-config.ts && tauri build"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -30,6 +34,8 @@
     "vite": "^8.3.0"
   },
   "devDependencies": {
+    "@tauri-apps/api": "^2.12.3",
+    "@tauri-apps/cli": "^2.12.2",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",

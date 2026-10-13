@@ -145,6 +145,46 @@ Open your browser at **`http://localhost:3000`**.
 
 ---
 
+### 🖥️ Run as Desktop App (Tauri)
+
+BBDB Manager can run as a standalone, ultra-lightweight native desktop app powered by **Tauri v2**.
+Seluruh konfigurasi desktop app (nama aplikasi, bundle ID, ukuran window, title, dll) **dipusatkan di `.env`**.
+
+#### 1. Konfigurasi Desktop via `.env`:
+```env
+TAURI_PRODUCT_NAME="BBDB Manager"
+TAURI_IDENTIFIER="com.bbdb.manager"
+TAURI_VERSION="1.0.0"
+TAURI_WINDOW_TITLE="BBDB Manager"
+TAURI_WINDOW_WIDTH=1280
+TAURI_WINDOW_HEIGHT=820
+TAURI_WINDOW_MIN_WIDTH=900
+TAURI_WINDOW_MIN_HEIGHT=600
+TAURI_WINDOW_RESIZABLE=true
+TAURI_WINDOW_FULLSCREEN=false
+```
+
+#### 2. Install Linux Prerequisites:
+```bash
+sudo apt update && sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
+#### 3. Run Desktop App in Development:
+```bash
+bun run desktop:dev
+# or: npm run desktop:dev
+```
+*(Script ini otomatis menyinkronkan `.env` ke konfigurasi Tauri sebelum aplikasi berjalan)*
+
+#### 4. Build Standalone Installer (.deb & .AppImage):
+```bash
+bun run desktop:build
+# or: npm run desktop:build
+```
+*File installer native akan dibuat di folder `src-tauri/target/release/bundle/` (ukuran instalasi ~15 MB).*
+
+---
+
 ## 📁 Project Structure
 
 ```
