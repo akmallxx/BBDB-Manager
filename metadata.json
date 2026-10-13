@@ -1,0 +1,6 @@
+{
+  "name": "Beekeeper Database Studio",
+  "description": "Desktop-grade Database Studio featuring multi-driver connection management with SSH tunnels, multi-tab SQL editor with autocomplete, yellow-highlighted data grid, transaction controls, and dual SQLite/JSON persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', Menlo, Monaco, Consolas, monospace;
+    --bk-yellow: #facc15;
+    --bk-yellow-hover: #eab308;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* Custom subtle scrollbars like Beekeeper desktop app */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(120, 120, 120, 0.25);
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(120, 120, 120, 0.45);
+  }
+}
+
+/* Tabular figures for grid numbers and telemetry */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Signature Beekeeper yellow focus cell */
+.bk-cell-selected {
+  outline: 2px solid #facc15 !important;
+  outline-offset: -2px;
+  background-color: rgba(250, 204, 21, 0.12) !important;
+  z-index: 10;
+}
