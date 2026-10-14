@@ -5,8 +5,8 @@
   "identifier": "com.bbdb.manager",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "devUrl": "http://localhost:3000",
-    "beforeBuildCommand": "bun run build",
+    "devUrl": "http://localhost:39000",
+    "beforeBuildCommand": "bun run build && bun run scripts/build-server.ts",
     "frontendDist": "../dist"
   },
   "app": {
@@ -43,6 +43,9 @@
           "libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37"
         ]
       }
-    }
+    },
+    "externalBin": [
+      "binaries/bbdb-server"
+    ]
   }
 }

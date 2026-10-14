@@ -20,7 +20,8 @@ const center = process.env.TAURI_WINDOW_CENTER !== 'false';
 const decorations = process.env.TAURI_WINDOW_DECORATIONS !== 'false';
 const devUrl = process.env.TAURI_DEV_URL || `http://localhost:${port}`;
 const beforeDevCommand = process.env.TAURI_BEFORE_DEV_COMMAND || 'bun run dev';
-const beforeBuildCommand = process.env.TAURI_BEFORE_BUILD_COMMAND || 'bun run build';
+const defaultBuildCmd = 'bun run build && bun run scripts/build-server.ts';
+const beforeBuildCommand = process.env.TAURI_BEFORE_BUILD_COMMAND || defaultBuildCmd;
 
 const tauriConfPath = path.resolve('src-tauri/tauri.conf.json');
 let tauriConf: any = {};
@@ -70,6 +71,9 @@ tauriConf.bundle.icon = [
   'icons/128x128@2x.png',
   'icons/icon.png',
   'icons/icon.ico'
+];
+tauriConf.bundle.externalBin = [
+  'binaries/bbdb-server'
 ];
 tauriConf.bundle.linux = {
   deb: {

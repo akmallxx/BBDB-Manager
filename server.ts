@@ -7,6 +7,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import pg from 'pg';
+import { Client as SSHClient, type ConnectConfig } from 'ssh2';
 
 const { Pool, Client } = pg;
 
@@ -72,8 +73,15 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '20mb' }));
 
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, status: 'healthy', app: APP_NAME });
+});
+
 // Ensure data directory exists
-const defaultDataDir = path.join(__dirname, 'data');
+const isBunCompiled = typeof process !== 'undefined' && (Boolean(process.execPath && process.execPath.includes('bbdb-server')) || __dirname.startsWith('/$bunfs'));
+const defaultDataDir = isBunCompiled
+  ? path.join(os.homedir(), '.bbdb-manager')
+  : path.join(__dirname, 'data');
 let dataDir = process.env.BBDB_DATA_DIR || defaultDataDir;
 try {
   if (!fs.existsSync(dataDir)) {
@@ -159,34 +167,6 @@ try { studioDb.exec('ALTER TABLE connections ADD COLUMN ssh_key_file TEXT;'); } 
 try { studioDb.exec('ALTER TABLE connections ADD COLUMN ssh_key_passphrase TEXT;'); } catch { }
 try { studioDb.exec("ALTER TABLE connections ADD COLUMN environment TEXT DEFAULT 'development';"); } catch { }
 
-// Seed default connection using real local PostgreSQL credentials (gast / password)
-const countStmt = studioDb.prepare('SELECT COUNT(*) as count FROM connections');
-const countRow = countStmt.get() as { count: number };
-
-if (countRow.count === 0) {
-  const insertConn = studioDb.prepare(`
-    INSERT INTO connections (
-      id, name, driver, host, port, username, password, default_database,
-      ssl, ssh_enabled, ssh_host, ssh_port, ssh_user, ssh_auth_method,
-      ssh_password, ssh_key_file, ssh_key_passphrase, color, is_readonly, environment, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  insertConn.run(
-    'conn-local-pg',
-    'Local PostgreSQL (gast)',
-    'postgresql',
-    'localhost',
-    5432,
-    'gast',
-    'password',
-    'database',
-    0, 0, '', 22, '', 'password', '', '', '',
-    '#06b6d4', 0, 'development',
-    new Date().toISOString()
-  );
-}
-
 function saveQueryHistory(
   connectionId: string,
   queryText: string,
@@ -204,7 +184,7 @@ function saveQueryHistory(
     `);
     insertHistory.run(
       id,
-      connectionId || 'conn-local-pg',
+      connectionId || 'unknown',
       queryText || '',
       status || 'success',
       rowCount ?? 0,
@@ -217,7 +197,185 @@ function saveQueryHistory(
   }
 }
 
-// 3. PostgreSQL Real Connection Pool Manager
+// 3. SSH Tunnel Management & PostgreSQL Real Connection Pool Manager
+interface SshTunnelParams {
+  ssh_host: string;
+  ssh_port: number;
+  ssh_user: string;
+  ssh_auth_method: 'password' | 'key';
+  ssh_password?: string;
+  ssh_key_file?: string;
+  ssh_key_passphrase?: string;
+  target_host: string;
+  target_port: number;
+}
+
+interface SshTunnelInstance {
+  localPort: number;
+  server: net.Server;
+  sshClient: SSHClient;
+  close: () => void;
+}
+
+const activeTunnels = new Map<string, SshTunnelInstance>();
+
+function createSshTunnel(params: SshTunnelParams): Promise<SshTunnelInstance> {
+  return new Promise((resolve, reject) => {
+    const ssh = new SSHClient();
+    let isResolved = false;
+
+    const cleanup = () => {
+      try { ssh.end(); } catch {}
+    };
+
+    const timer = setTimeout(() => {
+      if (!isResolved) {
+        isResolved = true;
+        cleanup();
+        reject(new Error(`SSH connection timed out after 10s to ${params.ssh_host}:${params.ssh_port}`));
+      }
+    }, 10000);
+
+    ssh.on('ready', () => {
+      const server = net.createServer((sock) => {
+        ssh.forwardOut(
+          '127.0.0.1',
+          sock.remotePort || 0,
+          params.target_host || '127.0.0.1',
+          params.target_port || 5432,
+          (err, stream) => {
+            if (err) {
+              console.error('[SSH Tunnel] ForwardOut error:', err.message);
+              sock.destroy(err);
+              return;
+            }
+            sock.pipe(stream).pipe(sock);
+            stream.on('error', () => sock.destroy());
+            sock.on('error', () => stream.destroy());
+          }
+        );
+      });
+
+      server.on('error', (err) => {
+        if (!isResolved) {
+          clearTimeout(timer);
+          isResolved = true;
+          cleanup();
+          reject(err);
+        }
+      });
+
+      server.listen(0, '127.0.0.1', () => {
+        clearTimeout(timer);
+        if (!isResolved) {
+          isResolved = true;
+          const address = server.address() as net.AddressInfo;
+          const localPort = address.port;
+          const close = () => {
+            try { server.close(); } catch {}
+            try { ssh.end(); } catch {}
+          };
+          resolve({ localPort, server, sshClient: ssh, close });
+        }
+      });
+    });
+
+    ssh.on('error', (err) => {
+      if (!isResolved) {
+        clearTimeout(timer);
+        isResolved = true;
+        cleanup();
+        reject(err);
+      }
+    });
+
+    const connectConfig: ConnectConfig = {
+      host: params.ssh_host,
+      port: params.ssh_port || 22,
+      username: params.ssh_user,
+      readyTimeout: 10000,
+      keepaliveInterval: 10000,
+    };
+
+    if (params.ssh_auth_method === 'key') {
+      if (!params.ssh_key_file) {
+        clearTimeout(timer);
+        return reject(new Error('SSH Key file path is required'));
+      }
+      const resolvedKey = params.ssh_key_file.startsWith('~')
+        ? path.join(os.homedir(), params.ssh_key_file.slice(1))
+        : params.ssh_key_file;
+      if (!fs.existsSync(resolvedKey)) {
+        clearTimeout(timer);
+        return reject(new Error(`SSH Private key file not found: ${params.ssh_key_file}`));
+      }
+      try {
+        connectConfig.privateKey = fs.readFileSync(resolvedKey);
+        if (params.ssh_key_passphrase) {
+          connectConfig.passphrase = params.ssh_key_passphrase;
+        }
+      } catch (e: any) {
+        clearTimeout(timer);
+        return reject(new Error(`Failed to read SSH private key: ${e.message}`));
+      }
+    } else {
+      connectConfig.password = params.ssh_password || '';
+    }
+
+    ssh.connect(connectConfig);
+  });
+}
+
+function closeTunnel(connId: string) {
+  if (activeTunnels.has(connId)) {
+    const t = activeTunnels.get(connId);
+    try { t?.close(); } catch {}
+    activeTunnels.delete(connId);
+  }
+  for (const [key, pool] of pgPools.entries()) {
+    if (key.startsWith(`${connId}:`)) {
+      try { pool.end(); } catch {}
+      pgPools.delete(key);
+    }
+  }
+}
+
+async function getOrCreateTunnel(conn: Record<string, unknown>): Promise<SshTunnelInstance> {
+  const connId = (conn.id as string) || 'default';
+  const existing = activeTunnels.get(connId);
+  if (existing) {
+    if (existing.server.listening) {
+      return existing;
+    }
+    try { existing.close(); } catch {}
+    activeTunnels.delete(connId);
+  }
+
+  const tunnel = await createSshTunnel({
+    ssh_host: (conn.ssh_host as string) || 'localhost',
+    ssh_port: Number(conn.ssh_port) || 22,
+    ssh_user: (conn.ssh_user as string) || 'root',
+    ssh_auth_method: ((conn.ssh_auth_method as string) || 'password') as 'password' | 'key',
+    ssh_password: (conn.ssh_password as string) || '',
+    ssh_key_file: (conn.ssh_key_file as string) || '',
+    ssh_key_passphrase: (conn.ssh_key_passphrase as string) || '',
+    target_host: (conn.host as string) || 'localhost',
+    target_port: Number(conn.port) || 5432,
+  });
+
+  tunnel.sshClient.on('close', () => {
+    activeTunnels.delete(connId);
+    try { tunnel.server.close(); } catch {}
+  });
+  tunnel.sshClient.on('error', () => {
+    activeTunnels.delete(connId);
+    try { tunnel.server.close(); } catch {}
+  });
+
+  activeTunnels.set(connId, tunnel);
+  return tunnel;
+}
+
 interface TableColumn {
   name: string;
   type: string;
@@ -227,15 +385,22 @@ interface TableColumn {
 
 const pgPools = new Map<string, pg.Pool>();
 
-function getPgPool(conn?: Record<string, unknown>, databaseOverride?: string): pg.Pool {
-  const host = (conn?.host as string) || 'localhost';
-  const port = Number(conn?.port) || 5432;
-  const user = (conn?.username as string) || 'gast';
-  const password = (conn?.password as string) || 'password';
-  const database = databaseOverride || (conn?.default_database as string) || 'database';
+async function getPgPool(conn?: Record<string, unknown>, databaseOverride?: string): Promise<pg.Pool> {
+  let host = (conn?.host as string) || 'localhost';
+  let port = Number(conn?.port) || 5432;
+  const user = (conn?.username as string) || 'postgres';
+  const password = (conn?.password as string) || '';
+  const database = databaseOverride || (conn?.default_database as string) || 'postgres';
   const ssl = Boolean(conn?.ssl);
+  const connId = (conn?.id as string) || 'default';
 
-  const cacheKey = `${host}:${port}:${user}:${database}:${ssl}`;
+  if (conn && Boolean(conn.ssh_enabled)) {
+    const tunnel = await getOrCreateTunnel(conn);
+    host = '127.0.0.1';
+    port = tunnel.localPort;
+  }
+
+  const cacheKey = `${connId}:${host}:${port}:${user}:${database}:${ssl}`;
   if (!pgPools.has(cacheKey)) {
     const pool = new Pool({
       host,
@@ -246,7 +411,7 @@ function getPgPool(conn?: Record<string, unknown>, databaseOverride?: string): p
       ssl: ssl ? { rejectUnauthorized: false } : false,
       max: 15,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 5000,
+      connectionTimeoutMillis: 8000,
     });
     pool.on('error', (err) => {
       console.error(`PostgreSQL Pool error (${cacheKey}):`, err.message);
@@ -275,14 +440,14 @@ function getConnectionRecord(connId?: string): Record<string, unknown> {
   }
 
   return {
-    id: 'conn-local-pg',
-    name: 'Local PostgreSQL (gast)',
+    id: connId || 'default',
+    name: 'New Connection',
     driver: 'postgresql',
     host: 'localhost',
     port: 5432,
-    username: 'gast',
-    password: 'password',
-    default_database: 'database',
+    username: 'postgres',
+    password: '',
+    default_database: 'postgres',
     ssl: 0,
     environment: 'development'
   };
@@ -321,9 +486,9 @@ app.post('/api/connections', (req, res) => {
       driver = 'postgresql',
       host = 'localhost',
       port = 5432,
-      username = 'gast',
+      username = '',
       password = '',
-      default_database = 'database',
+      default_database = 'postgres',
       ssl = 0,
       ssh_enabled = 0,
       ssh_host = '',
@@ -391,6 +556,7 @@ app.put('/api/connections/:id', (req, res) => {
       color, is_readonly ? 1 : 0, environment, id
     );
 
+    closeTunnel(id);
     const updated = studioDb.prepare('SELECT * FROM connections WHERE id = ?').get(id);
     res.json(updated);
   } catch (err: unknown) {
@@ -402,6 +568,7 @@ app.put('/api/connections/:id', (req, res) => {
 app.delete('/api/connections/:id', (req, res) => {
   try {
     const { id } = req.params;
+    closeTunnel(id);
     studioDb.prepare('DELETE FROM connections WHERE id = ?').run(id);
     res.json({ success: true, id });
   } catch (err: unknown) {
@@ -427,12 +594,14 @@ app.post('/api/connections/test', async (req, res) => {
     ssh_auth_method = 'password',
     ssh_password = '',
     ssh_key_file = '',
+    ssh_key_passphrase = '',
     environment
   } = req.body;
 
   const startTime = performance.now();
+  let testTunnel: SshTunnelInstance | null = null;
 
-  // 1. SSH Tunnel Validation & Reachability Check
+  // 1. Establish Real SSH Tunnel if enabled
   if (ssh_enabled) {
     if (!ssh_host || !ssh_user) {
       return res.status(400).json({
@@ -464,20 +633,31 @@ app.post('/api/connections/test', async (req, res) => {
       }
     }
 
-    // Verify TCP socket reachability to the SSH host and port
-    const sshReachability = await testTcpConnection(ssh_host, Number(ssh_port) || 22, 4000);
-    if (!sshReachability.ok) {
+    try {
+      testTunnel = await createSshTunnel({
+        ssh_host: ssh_host as string,
+        ssh_port: Number(ssh_port) || 22,
+        ssh_user: ssh_user as string,
+        ssh_auth_method: ssh_auth_method as 'password' | 'key',
+        ssh_password: ssh_password as string,
+        ssh_key_file: ssh_key_file as string,
+        ssh_key_passphrase: ssh_key_passphrase as string,
+        target_host: host || 'localhost',
+        target_port: Number(port) || (driver === 'postgresql' ? 5432 : driver === 'mysql' ? 3306 : 1433),
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
       return res.status(400).json({
         success: false,
-        message: `SSH Tunnel Error: Could not connect to SSH host ${ssh_host}:${ssh_port} (${sshReachability.error}).`
+        message: `SSH Tunnel Error: ${msg}`
       });
     }
   }
 
   // 2. Real Driver-Specific Connection Tests
   if (driver === 'postgresql') {
-    const targetHost = host || 'localhost';
-    const targetPort = Number(port) || 5432;
+    const targetHost = testTunnel ? '127.0.0.1' : (host || 'localhost');
+    const targetPort = testTunnel ? testTunnel.localPort : (Number(port) || 5432);
     const targetDb = default_database || 'postgres';
     const targetUser = username !== undefined ? username : '';
     const targetPass = password !== undefined ? String(password) : '';
@@ -490,33 +670,63 @@ app.post('/api/connections/test', async (req, res) => {
       password: targetPass,
       database: targetDb,
       ssl: isSslEnabled ? { rejectUnauthorized: false } : false,
-      connectionTimeoutMillis: 5000,
+      connectionTimeoutMillis: 7000,
     });
 
     try {
       await client.connect();
       const versionRes = await client.query('SELECT version();');
       await client.end();
+      if (testTunnel) testTunnel.close();
       const latency = Math.round(performance.now() - startTime);
       return res.json({
         success: true,
-        message: `Connected successfully to PostgreSQL at ${targetHost}:${targetPort}/${targetDb}${isSslEnabled ? ' (SSL Active)' : ''}${ssh_enabled ? ` via SSH (${ssh_user}@${ssh_host})` : ''}`,
+        message: `Connected successfully to PostgreSQL at ${host || 'localhost'}:${port || 5432}/${targetDb}${isSslEnabled ? ' (SSL Active)' : ''}${ssh_enabled ? ` via SSH (${ssh_user}@${ssh_host}:${ssh_port || 22})` : ''}`,
         version: versionRes.rows[0]?.version,
         latency_ms: latency
       });
     } catch (err: unknown) {
+      if (targetPass && targetPass !== targetPass.trim()) {
+        try {
+          const retryClient = new Client({
+            host: targetHost,
+            port: targetPort,
+            user: targetUser,
+            password: targetPass.trim(),
+            database: targetDb,
+            ssl: isSslEnabled ? { rejectUnauthorized: false } : false,
+            connectionTimeoutMillis: 7000,
+          });
+          await retryClient.connect();
+          const versionRes = await retryClient.query('SELECT version();');
+          await retryClient.end();
+          if (testTunnel) testTunnel.close();
+          const latency = Math.round(performance.now() - startTime);
+          return res.json({
+            success: true,
+            message: `Connected successfully! (Note: Leading/trailing space in password was auto-trimmed)`,
+            version: versionRes.rows[0]?.version,
+            latency_ms: latency
+          });
+        } catch {
+          // continue to original error reporting
+        }
+      }
+
+      if (testTunnel) testTunnel.close();
       const msg = err instanceof Error ? err.message : String(err);
       return res.status(400).json({
         success: false,
-        message: `PostgreSQL Connection Failed: ${msg}`
+        message: `PostgreSQL Connection Failed: ${msg}${targetPass && targetPass !== targetPass.trim() ? ' (Tip: Your DB password contains leading/trailing spaces!)' : ''}`
       });
     }
   }
 
   if (driver === 'mysql' || driver === 'sqlserver') {
-    const targetHost = host || 'localhost';
-    const targetPort = Number(port) || (driver === 'mysql' ? 3306 : 1433);
+    const targetHost = testTunnel ? '127.0.0.1' : (host || 'localhost');
+    const targetPort = testTunnel ? testTunnel.localPort : (Number(port) || (driver === 'mysql' ? 3306 : 1433));
     const tcpCheck = await testTcpConnection(targetHost, targetPort, 4000);
+    if (testTunnel) testTunnel.close();
     if (!tcpCheck.ok) {
       return res.status(400).json({
         success: false,
@@ -526,12 +736,13 @@ app.post('/api/connections/test', async (req, res) => {
     const latency = Math.round(performance.now() - startTime);
     return res.json({
       success: true,
-      message: `Connected successfully to ${driver.toUpperCase()} at ${targetHost}:${targetPort}${ssl ? ' (SSL Enabled)' : ''}${ssh_enabled ? ` via SSH (${ssh_user}@${ssh_host})` : ''}`,
+      message: `Connected successfully to ${driver.toUpperCase()} at ${host || 'localhost'}:${port || 3306}${ssl ? ' (SSL Enabled)' : ''}${ssh_enabled ? ` via SSH (${ssh_user}@${ssh_host}:${ssh_port || 22})` : ''}`,
       latency_ms: latency
     });
   }
 
   if (driver === 'sqlite') {
+    if (testTunnel) testTunnel.close();
     const dbFilePath = default_database || host;
     if (!dbFilePath) {
       return res.status(400).json({
@@ -569,21 +780,22 @@ app.post('/api/connections/test', async (req, res) => {
 app.get('/api/connections/:id/databases', async (req, res) => {
   const { id } = req.params;
   const conn = getConnectionRecord(id);
+  const defaultDb = (conn.default_database as string) || 'postgres';
 
   try {
-    const pool = getPgPool(conn, 'postgres');
+    const pool = await getPgPool(conn, defaultDb);
     const result = await pool.query('SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;');
     const databases = result.rows.map(r => r.datname);
 
     res.json({
-      current: (conn.default_database as string) || 'database',
-      databases
+      current: defaultDb,
+      databases: databases.length > 0 ? databases : [defaultDb]
     });
   } catch (err: unknown) {
     console.error('Error fetching databases:', err);
     res.json({
-      current: (conn.default_database as string) || 'database',
-      databases: ['database', 'pos', 'postgres']
+      current: defaultDb,
+      databases: [defaultDb]
     });
   }
 });
@@ -592,10 +804,10 @@ app.get('/api/connections/:id/databases', async (req, res) => {
 app.get('/api/connections/:id/schemas', async (req, res) => {
   const { id } = req.params;
   const conn = getConnectionRecord(id);
-  const database = (req.query.database as string) || (conn.default_database as string) || 'database';
+  const database = (req.query.database as string) || (conn.default_database as string) || 'postgres';
 
   try {
-    const pool = getPgPool(conn, database);
+    const pool = await getPgPool(conn, database);
 
     const query = `
       SELECT
@@ -660,10 +872,10 @@ app.get('/api/connections/:id/schemas', async (req, res) => {
 app.get('/api/connections/:id/tables/:tableName/columns', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
-  const database = (req.query.database as string) || (conn.default_database as string) || 'database';
+  const database = (req.query.database as string) || (conn.default_database as string) || 'postgres';
   const schema = (req.query.schema as string) || 'public';
   try {
-    const pool = getPgPool(conn, database);
+    const pool = await getPgPool(conn, database);
     const colQuery = `
       SELECT 
         c.column_name as name,
@@ -693,10 +905,10 @@ app.get('/api/connections/:id/tables/:tableName/columns', async (req, res) => {
 app.get('/api/connections/:id/tables/:tableName/ddl', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
-  const database = (req.query.database as string) || (conn.default_database as string) || 'database';
+  const database = (req.query.database as string) || (conn.default_database as string) || 'postgres';
   const schema = (req.query.schema as string) || 'public';
   try {
-    const pool = getPgPool(conn, database);
+    const pool = await getPgPool(conn, database);
 
     // Columns detail with data types, nullability, defaults
     const colSql = `
@@ -780,8 +992,9 @@ app.get('/api/connections/:id/tables/:tableName/ddl', async (req, res) => {
 // 4d. Truncate Table Endpoint
 app.post('/api/connections/:id/tables/:tableName/truncate', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
+  const conn = getConnectionRecord(connectionId);
   const {
-    database = 'database',
+    database = (conn.default_database as string) || 'postgres',
     schema = 'public',
     cascade = false,
     autocommit = true,
@@ -817,7 +1030,7 @@ app.post('/api/connections/:id/tables/:tableName/truncate', async (req, res) => 
 app.get('/api/connections/:id/tables/:tableName/data', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
-  const database = (req.query.database as string) || (conn.default_database as string) || 'database';
+  const database = (req.query.database as string) || (conn.default_database as string) || 'postgres';
   const schema = (req.query.schema as string) || 'public';
   const page = Math.max(1, parseInt(req.query.page as string || '1', 10));
   const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string || '50', 10)));
@@ -830,7 +1043,7 @@ app.get('/api/connections/:id/tables/:tableName/data', async (req, res) => {
   const sortDir = (req.query.sortDir as string)?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
   try {
-    const pool = getPgPool(conn, database);
+    const pool = await getPgPool(conn, database);
 
     // 1. Column Metadata & Primary Keys
     const colQuery = `
@@ -974,7 +1187,7 @@ async function executeQueryWithSession(
   const isProd = conn.environment === 'production';
   const effectiveAutocommit = isProd ? false : autocommit;
 
-  const pool = getPgPool(conn, database);
+  const pool = await getPgPool(conn, database);
   const startTime = performance.now();
 
   if (effectiveAutocommit) {
@@ -1025,8 +1238,9 @@ async function executeQueryWithSession(
 // 6. Insert Row (Create)
 app.post('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
+  const conn = getConnectionRecord(connectionId);
   const {
-    database = 'database',
+    database = (conn.default_database as string) || 'postgres',
     schema = 'public',
     rowData,
     autocommit = true,
@@ -1084,8 +1298,9 @@ app.post('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
 // 7. Update Row / Cell (Update)
 app.put('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
+  const conn = getConnectionRecord(connectionId);
   const {
-    database = 'database',
+    database = (conn.default_database as string) || 'postgres',
     schema = 'public',
     identifierColumn,
     identifierValue,
@@ -1147,8 +1362,9 @@ app.put('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
 // 8. Delete Row (Delete)
 app.delete('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
+  const conn = getConnectionRecord(connectionId);
   const {
-    database = 'database',
+    database = (conn.default_database as string) || 'postgres',
     schema = 'public',
     identifierColumn,
     identifierValue,
@@ -1195,7 +1411,7 @@ app.post('/api/query', async (req, res) => {
   const startTime = performance.now();
   const {
     connectionId,
-    database = 'tm_rs_sisma_medika',
+    database,
     query = '',
     autocommit = true,
     sessionId
@@ -1212,8 +1428,9 @@ app.post('/api/query', async (req, res) => {
   }
 
   const conn = getConnectionRecord(connectionId);
+  const targetDb = database || (conn.default_database as string) || 'postgres';
   const sessionKey = sessionId || connectionId || 'default';
-  const pool = getPgPool(conn, database);
+  const pool = await getPgPool(conn, targetDb);
 
   // 1. Explicit COMMIT statement
   if (/^COMMIT(\s*;)?$/i.test(trimmed)) {
@@ -1657,7 +1874,7 @@ app.post('/api/export', (req, res) => {
 
 // Vite Integration (Dev Middleware or Production Static)
 async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
+  const isProd = process.env.NODE_ENV === 'production' || isBunCompiled;
 
   if (!isProd) {
     try {

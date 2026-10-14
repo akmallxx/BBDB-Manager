@@ -32,8 +32,8 @@ function AppContent() {
   const [activeConnection, setActiveConnection] = useState<DatabaseConnection | null>(null);
 
   // Entities & Database Schemas
-  const [activeDatabase, setActiveDatabase] = useState('database');
-  const [databasesList, setDatabasesList] = useState<string[]>(['database']);
+  const [activeDatabase, setActiveDatabase] = useState('');
+  const [databasesList, setDatabasesList] = useState<string[]>([]);
   const [schemas, setSchemas] = useState<SchemaGroup[]>([]);
   const [totalEntities, setTotalEntities] = useState(0);
 
@@ -147,8 +147,8 @@ function AppContent() {
     setActiveConnection(null);
     setSelectedConnectionId(undefined);
     setSchemas([]);
-    setDatabasesList(['database']);
-    setActiveDatabase('database');
+    setDatabasesList([]);
+    setActiveDatabase('');
     setInTransaction(false);
 
     // Reset workspace tabs to clean "New Connection" tab
@@ -169,7 +169,7 @@ function AppContent() {
   const handleConnect = async (conn: DatabaseConnection) => {
     setActiveConnection(conn);
     setSelectedConnectionId(conn.id);
-    const targetDb = conn.default_database || 'tm_rs_sisma_medika';
+    const targetDb = conn.default_database || 'postgres';
     setActiveDatabase(targetDb);
 
     // Save/persist connection so backend SQLite has the latest credentials and environment
@@ -194,20 +194,42 @@ function AppContent() {
         setDatabasesList(dbData.databases || [targetDb]);
       }
 
-      await fetchSchemas(conn.id, targetDb);
+      // Fetch schemas for active database
+      const schemaRes = await fetch(`/api/connections/${conn.id}/schemas?database=${encodeURIComponent(targetDb)}`);
+      let fetchedSchemas: SchemaGroup[] = [];
+      if (schemaRes.ok) {
+        const schemaData = await schemaRes.json();
+        fetchedSchemas = schemaData.schemas || [];
+        setSchemas(fetchedSchemas);
+        setTotalEntities(schemaData.totalEntities || 0);
+      }
 
-      // Open Table Tab for mst_pasien or first table
-      const initialTab: WorkspaceTab = {
-        id: `tab-tbl-${Date.now()}`,
-        type: 'table_data',
-        title: 'mst_pasien',
-        connectionId: conn.id,
-        tableName: 'mst_pasien',
-        schemaName: 'public'
-      };
+      // Find first existing table in database
+      const firstSchemaWithTables = fetchedSchemas.find(s => s.tables && s.tables.length > 0) || fetchedSchemas[0];
+      const firstTable = firstSchemaWithTables?.tables?.[0];
+
+      let initialTab: WorkspaceTab;
+      if (firstTable) {
+        initialTab = {
+          id: `tab-tbl-${Date.now()}`,
+          type: 'table_data',
+          title: firstTable.name,
+          connectionId: conn.id,
+          tableName: firstTable.name,
+          schemaName: firstSchemaWithTables.name || 'public'
+        };
+      } else {
+        initialTab = {
+          id: `tab-query-${Date.now()}`,
+          type: 'query_editor',
+          title: 'Query #1',
+          connectionId: conn.id,
+          queryText: `SELECT current_database(), current_user, version();`
+        };
+      }
 
       setTabs(prev => {
-        // Replace connection tabs with the connected database table tab
+        // Replace connection tabs with the initial tab
         const dataTabs = prev.filter(t => t.type !== 'connection_form');
         return [initialTab, ...dataTabs];
       });
@@ -303,12 +325,15 @@ function AppContent() {
     const nextCount = queryCounter + 1;
     setQueryCounter(nextCount);
 
+    const firstTableName = schemas.find(s => s.tables && s.tables.length > 0)?.tables?.[0]?.name;
+    const fallbackSql = firstTableName ? `SELECT * FROM ${firstTableName} LIMIT 50;` : 'SELECT current_database(), now();';
+
     const newTab: WorkspaceTab = {
       id: `tab-query-${Date.now()}`,
       type: 'query_editor',
       title: `Query #${nextCount}`,
       connectionId: activeConnection?.id,
-      queryText: customQuery || `SELECT * FROM ${schemas[0]?.tables[0]?.name || 'mst_pasien'} LIMIT 50;`
+      queryText: customQuery || fallbackSql
     };
 
     setTabs(prev => [...prev, newTab]);
@@ -567,7 +592,7 @@ function AppContent() {
               connectionId={activeConnection.id}
               database={activeDatabase}
               schemaName={activeTab.schemaName || 'public'}
-              tableName={activeTab.tableName || 'mst_pasien'}
+              tableName={activeTab.tableName || ''}
               autocommit={autocommit}
               inTransaction={inTransaction}
               onTransactionChange={setInTransaction}

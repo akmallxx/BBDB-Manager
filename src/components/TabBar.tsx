@@ -112,23 +112,6 @@ export function TabBar({
 
       {/* Right Controls: Manual Commit / Autocommit & Connection Info & Upgrade Badge */}
       <div className="flex items-center gap-2 pl-3 shrink-0">
-        {activeConnectionEnvironment === 'production' && (
-          <div
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-red-950/60 border border-red-500/40 text-red-300 text-[11px] font-semibold animate-pulse"
-            title="Production Database Active: Autocommit is disabled. Manual commit required to persist changes."
-          >
-            <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
-            <span className="font-mono text-[10px] tracking-wide">PROD • MANUAL COMMIT</span>
-          </div>
-        )}
-        {activeConnectionEnvironment === 'test' && (
-          <div
-            className="flex items-center gap-1 px-2 py-0.5 rounded bg-amber-950/50 border border-amber-500/30 text-amber-300 text-[10px] font-mono font-bold"
-            title="Test / Staging Database"
-          >
-            TEST / STAGING
-          </div>
-        )}
 
         {/* Manual Commit & Autocommit Switch */}
         <div className="flex items-center gap-2 bg-zinc-900 border border-zinc-800 rounded px-2 py-0.5">

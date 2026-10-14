@@ -128,7 +128,7 @@ function beautifySql(sql: string): string {
 }
 
 export function SqlEditorView({
-  initialQuery = 'SELECT * FROM mst_pasien LIMIT 50;',
+  initialQuery = 'SELECT 1;',
   connection,
   connectionId,
   database,
@@ -794,7 +794,7 @@ export function SqlEditorView({
             onSelect={handleSelectionChange}
             onKeyUp={handleSelectionChange}
             onMouseUp={handleSelectionChange}
-            placeholder="-- Write your SQL query here (e.g. SELECT * FROM mst_pasien LIMIT 50;)"
+            placeholder="-- Write your SQL query here (e.g. SELECT * FROM table_name LIMIT 50;)"
             spellCheck={false}
             className="w-full h-full p-2 bg-transparent text-transparent caret-yellow-400 placeholder:text-zinc-600 focus:outline-none resize-none leading-5 font-mono text-xs select-text overflow-auto absolute inset-0 z-10 selection:bg-yellow-400/30 selection:text-white"
           />

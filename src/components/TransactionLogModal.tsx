@@ -108,7 +108,7 @@ export function TransactionLogModal({
                 )}
               </div>
               <p className="text-[11px] text-zinc-400 font-mono mt-0.5">
-                Target: {database || 'tm_rs_sisma_medika'}
+                Target: {database || 'postgres'}
               </p>
             </div>
           </div>

@@ -813,7 +813,7 @@ export function DataTableView({
                         className="p-1 rounded hover:bg-zinc-800 text-zinc-400 hover:text-yellow-400 transition-colors cursor-pointer"
                         title="Row Actions & SQL Generator (Right click)"
                       >
-                        <MoreVertical className="w-3.5 h-3.5" />
+                        <MoreVertical className="w-2 h-2" />
                       </button>
                     </div>
                   </td>
