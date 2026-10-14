@@ -739,9 +739,9 @@ export function DataTableView({
         <table className="min-w-full w-max border-collapse select-text">
           {/* Header Row */}
           <thead className="sticky top-0 z-20 bg-zinc-900 border-b border-zinc-800 shadow-sm">
-            <tr>
+            <tr className="h-8">
               {/* Row Number Header + Row Actions */}
-              <th className="w-14 px-2 py-1.5 text-center text-zinc-500 font-normal border-r border-zinc-800 select-none bg-zinc-900/90">
+              <th className="w-12 px-2 py-1.5 text-center text-zinc-500 font-normal border-r border-zinc-800 select-none bg-zinc-900/90">
                 #
               </th>
 
@@ -797,23 +797,23 @@ export function DataTableView({
                   key={rowIdx}
                   onContextMenu={e => handleRowContextMenu(rowIdx, e)}
                   className={cn(
-                    'border-b border-zinc-900 group transition-colors',
+                    'border-b border-zinc-900 group transition-colors h-7',
                     isRowSelected ? 'bg-zinc-900/40' : 'hover:bg-zinc-900/30'
                   )}
                 >
                   {/* Row Number Column + 3-dots / Context Menu Actions */}
                   <td
                     onContextMenu={e => handleRowContextMenu(rowIdx, e)}
-                    className="w-12 px-1 py-1 text-center text-zinc-500 text-[10px] border-r border-zinc-800 select-none bg-zinc-950 relative group-hover:bg-zinc-900/80"
+                    className="w-12 h-7 p-0 text-center text-zinc-500 text-[10px] border-r border-zinc-800 select-none bg-zinc-950 relative group-hover:bg-zinc-900/80"
                   >
-                    <span className="group-hover:hidden">{rowIdx + 1}</span>
-                    <div className="hidden group-hover:flex items-center justify-center">
+                    <div className="w-full h-full flex items-center justify-center">
+                      <span className="group-hover:hidden leading-none select-none">{rowIdx + 1}</span>
                       <button
                         onClick={e => handleRowThreeDotsClick(rowIdx, e)}
-                        className="p-1 rounded hover:bg-zinc-800 text-zinc-400 hover:text-yellow-400 transition-colors cursor-pointer"
+                        className="hidden group-hover:inline-flex items-center justify-center w-5 h-5 rounded hover:bg-zinc-800 text-zinc-400 hover:text-yellow-400 transition-colors cursor-pointer"
                         title="Row Actions & SQL Generator (Right click)"
                       >
-                        <MoreVertical className="w-2 h-2" />
+                        <MoreVertical className="w-3 h-3" />
                       </button>
                     </div>
                   </td>
@@ -832,7 +832,7 @@ export function DataTableView({
                         onClick={() => setSelectedCell({ row: rowIdx, col: colIdx })}
                         onDoubleClick={() => startInlineEdit(rowIdx, col.name, val)}
                         className={cn(
-                          'px-3 py-1 border-r border-zinc-800 whitespace-nowrap overflow-hidden text-ellipsis cursor-cell transition-all relative max-w-[400px]',
+                          'px-3 py-1 h-7 border-r border-zinc-800 whitespace-nowrap overflow-hidden text-ellipsis cursor-cell transition-colors relative max-w-[400px]',
                           isSelected && 'bk-cell-selected'
                         )}
                       >
