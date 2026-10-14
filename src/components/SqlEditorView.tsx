@@ -710,13 +710,6 @@ export function SqlEditorView({
 
         {/* Right Status & Export */}
         <div className="flex items-center gap-2">
-          {/* Manual Commit Banner / Status */}
-          {(!autocommit || inTransaction) && (
-            <div className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/30 rounded px-2 py-0.5 text-[11px] text-amber-300 font-mono">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-              <span>Manual Commit Active</span>
-            </div>
-          )}
 
           {result && result.rows && result.rows.length > 0 && (
             <div className="flex items-center gap-1">

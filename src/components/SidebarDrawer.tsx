@@ -258,7 +258,6 @@ export function SidebarDrawer({
           <div className="p-3 border-b border-zinc-800/80 space-y-2">
             {/* App Brand Header */}
             <div className="flex items-center gap-2 px-0.5 pb-1">
-              <img src="/logo.png" alt={APP_NAME} className="w-5 h-5 rounded object-contain shadow-xs" />
               <span className="text-xs font-semibold font-mono tracking-wider text-zinc-200">{APP_NAME}</span>
             </div>
 
