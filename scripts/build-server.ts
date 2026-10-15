@@ -8,14 +8,24 @@ function findBun(): string | null {
     return process.env.BUN_PATH;
   }
   try {
-    const which = execSync('which bun', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+    const cmd = process.platform === 'win32' ? 'where bun' : 'which bun';
+    const which = execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).split(/\r?\n/)[0]?.trim();
     if (which && fs.existsSync(which)) return which;
+  } catch {
+    // ignore
+  }
+
+  // Check if bun is executable directly in PATH
+  try {
+    execSync('bun --version', { stdio: 'ignore' });
+    return 'bun';
   } catch {
     // ignore
   }
 
   const commonPaths = [
     path.join(os.homedir(), '.bun/bin/bun'),
+    path.join(os.homedir(), '.bun/bin/bun.exe'),
     '/usr/local/bin/bun',
     '/usr/bin/bun',
   ];

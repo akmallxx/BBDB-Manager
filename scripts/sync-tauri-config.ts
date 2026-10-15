@@ -8,7 +8,7 @@ dotenv.config();
 const appName = process.env.TAURI_PRODUCT_NAME || process.env.VITE_APP_NAME || process.env.APP_NAME || 'BBDB Manager';
 const port = process.env.PORT || '3000';
 const identifier = process.env.TAURI_IDENTIFIER || `com.${appName.toLowerCase().replace(/[^a-z0-9]/g, '')}.manager`;
-const version = process.env.TAURI_VERSION || '1.0.0';
+const version = (process.env.TAURI_VERSION || '1.0.0').replace(/^v/, '');
 const windowTitle = process.env.TAURI_WINDOW_TITLE || appName;
 const width = parseInt(process.env.TAURI_WINDOW_WIDTH || '1280', 10);
 const height = parseInt(process.env.TAURI_WINDOW_HEIGHT || '820', 10);
