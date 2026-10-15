@@ -237,6 +237,14 @@ export function ConnectionView({
       if (proto.includes('postgres')) setDriver('postgresql');
       else if (proto.includes('mysql')) setDriver('mysql');
       else if (proto.includes('sqlserver') || proto.includes('mssql')) setDriver('sqlserver');
+      else if (proto.includes('sqlite')) {
+        setDriver('sqlite');
+        setDefaultDatabase(parsed.pathname || 'database.db');
+        setConnectionName('Imported SQLite DB');
+        setShowUrlModal(false);
+        info('URL Imported', `Configured connection from SQLite string.`);
+        return;
+      }
 
       setHost(parsed.hostname || 'localhost');
       if (parsed.port) setPort(parseInt(parsed.port, 10));
@@ -247,7 +255,7 @@ export function ConnectionView({
       setShowUrlModal(false);
       info('URL Imported', `Configured connection from ${proto} string.`);
     } catch {
-      error('Invalid URL', 'Please provide a valid connection string (e.g. postgresql://user:pass@localhost:5432/mydb)');
+      error('Invalid URL', 'Please provide a valid connection string (e.g. postgresql://user:pass@localhost:5432/mydb, mysql://..., sqlite:///path/db.sqlite)');
     }
   };
 

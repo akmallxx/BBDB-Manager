@@ -230,7 +230,8 @@ function AppContent() {
   const handleConnect = async (conn: DatabaseConnection) => {
     setActiveConnection(conn);
     setSelectedConnectionId(conn.id);
-    const targetDb = conn.default_database || 'postgres';
+    const defaultFallback = conn.driver === 'sqlite' ? 'main' : conn.driver === 'sqlserver' ? 'master' : conn.driver === 'mysql' ? '' : 'postgres';
+    let targetDb = conn.default_database || defaultFallback;
     setActiveDatabase(targetDb);
 
     // Save/persist connection so backend SQLite has the latest credentials and environment
@@ -249,14 +250,20 @@ function AppContent() {
 
     try {
       // Get databases list
+      let activeDb = targetDb;
       const dbRes = await fetch(`/api/connections/${conn.id}/databases`);
       if (dbRes.ok) {
         const dbData = await dbRes.json();
-        setDatabasesList(dbData.databases || [targetDb]);
+        const dbs: string[] = dbData.databases || [targetDb];
+        setDatabasesList(dbs);
+        if (dbData.current && (!activeDb || !dbs.includes(activeDb))) {
+          activeDb = dbData.current;
+          setActiveDatabase(activeDb);
+        }
       }
 
       // Fetch schemas for active database
-      const schemaRes = await fetch(`/api/connections/${conn.id}/schemas?database=${encodeURIComponent(targetDb)}`);
+      const schemaRes = await fetch(`/api/connections/${conn.id}/schemas?database=${encodeURIComponent(activeDb)}`);
       let fetchedSchemas: SchemaGroup[] = [];
       if (schemaRes.ok) {
         const schemaData = await schemaRes.json();
@@ -277,15 +284,24 @@ function AppContent() {
           title: firstTable.name,
           connectionId: conn.id,
           tableName: firstTable.name,
-          schemaName: firstSchemaWithTables.name || 'public'
+          schemaName: firstSchemaWithTables?.name || (conn.driver === 'sqlite' ? 'main' : conn.driver === 'sqlserver' ? 'dbo' : conn.driver === 'mysql' ? (conn.default_database || '') : 'public')
         };
       } else {
+        let defaultQueryText = `SELECT current_database(), current_user, version();`;
+        if (conn.driver === 'mysql') {
+          defaultQueryText = `SELECT VERSION(), DATABASE(), CURRENT_USER();`;
+        } else if (conn.driver === 'sqlite') {
+          defaultQueryText = `SELECT sqlite_version();`;
+        } else if (conn.driver === 'sqlserver') {
+          defaultQueryText = `SELECT @@VERSION as version, DB_NAME() as database_name, SYSTEM_USER as user_name;`;
+        }
+
         initialTab = {
           id: `tab-query-${Date.now()}`,
           type: 'query_editor',
           title: 'Query #1',
           connectionId: conn.id,
-          queryText: `SELECT current_database(), current_user, version();`
+          queryText: defaultQueryText
         };
       }
 

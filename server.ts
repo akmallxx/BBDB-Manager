@@ -8,6 +8,15 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import pg from 'pg';
 import { Client as SSHClient, type ConnectConfig } from 'ssh2';
+import {
+  getAdapter,
+  createAdapter,
+  getDefaultDatabase,
+  getDefaultSchema,
+  type DatabaseDriverAdapter,
+  type TransactionSession,
+  type ColumnMeta
+} from './server/adapters/index.ts';
 
 const { Pool, Client } = pg;
 
@@ -332,10 +341,10 @@ function closeTunnel(connId: string) {
     try { t?.close(); } catch {}
     activeTunnels.delete(connId);
   }
-  for (const [key, pool] of pgPools.entries()) {
-    if (key.startsWith(`${connId}:`)) {
-      try { pool.end(); } catch {}
-      pgPools.delete(key);
+  for (const [key, session] of activeSessions.entries()) {
+    if (session.connectionId === connId) {
+      try { session.release(); } catch {}
+      activeSessions.delete(key);
     }
   }
 }
@@ -360,7 +369,7 @@ async function getOrCreateTunnel(conn: Record<string, unknown>): Promise<SshTunn
     ssh_key_file: (conn.ssh_key_file as string) || '',
     ssh_key_passphrase: (conn.ssh_key_passphrase as string) || '',
     target_host: (conn.host as string) || 'localhost',
-    target_port: Number(conn.port) || 5432,
+    target_port: Number(conn.port) || (conn.driver === 'mysql' ? 3306 : conn.driver === 'sqlserver' ? 1433 : 5432),
   });
 
   tunnel.sshClient.on('close', () => {
@@ -376,49 +385,43 @@ async function getOrCreateTunnel(conn: Record<string, unknown>): Promise<SshTunn
   return tunnel;
 }
 
-interface TableColumn {
-  name: string;
-  type: string;
-  nullable: boolean;
-  isPrimary?: boolean;
+type TableColumn = ColumnMeta;
+
+interface CompletedTransaction {
+  id: string;
+  connectionId: string;
+  database: string;
+  startedAt: string;
+  endedAt: string;
+  action: 'committed' | 'rolled_back';
+  durationMs: number;
+  statementCount: number;
+  statements: Array<{
+    id: string;
+    query: string;
+    timestamp: string;
+    duration_ms: number;
+    rowCount: number;
+    status: 'pending' | 'success' | 'error';
+    errorMessage?: string;
+  }>;
 }
 
-const pgPools = new Map<string, pg.Pool>();
+const activeSessions = new Map<string, TransactionSession>();
+const transactionHistoryList: CompletedTransaction[] = [];
 
-async function getPgPool(conn?: Record<string, unknown>, databaseOverride?: string): Promise<pg.Pool> {
-  let host = (conn?.host as string) || 'localhost';
-  let port = Number(conn?.port) || 5432;
-  const user = (conn?.username as string) || 'postgres';
-  const password = (conn?.password as string) || '';
-  const database = databaseOverride || (conn?.default_database as string) || 'postgres';
-  const ssl = Boolean(conn?.ssl);
-  const connId = (conn?.id as string) || 'default';
-
-  if (conn && Boolean(conn.ssh_enabled)) {
-    const tunnel = await getOrCreateTunnel(conn);
-    host = '127.0.0.1';
-    port = tunnel.localPort;
+async function getOrCreateSession(
+  adapter: DatabaseDriverAdapter,
+  connectionId: string,
+  database: string,
+  sessionKey: string
+): Promise<TransactionSession> {
+  let session = activeSessions.get(sessionKey);
+  if (!session) {
+    session = await adapter.createTransactionSession(sessionKey);
+    activeSessions.set(sessionKey, session);
   }
-
-  const cacheKey = `${connId}:${host}:${port}:${user}:${database}:${ssl}`;
-  if (!pgPools.has(cacheKey)) {
-    const pool = new Pool({
-      host,
-      port,
-      user,
-      password,
-      database,
-      ssl: ssl ? { rejectUnauthorized: false } : false,
-      max: 15,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 8000,
-    });
-    pool.on('error', (err) => {
-      console.error(`PostgreSQL Pool error (${cacheKey}):`, err.message);
-    });
-    pgPools.set(cacheKey, pool);
-  }
-  return pgPools.get(cacheKey)!;
+  return session;
 }
 
 function getConnectionRecord(connId?: string): Record<string, unknown> {
@@ -654,216 +657,79 @@ app.post('/api/connections/test', async (req, res) => {
     }
   }
 
-  // 2. Real Driver-Specific Connection Tests
-  if (driver === 'postgresql') {
-    const targetHost = testTunnel ? '127.0.0.1' : (host || 'localhost');
-    const targetPort = testTunnel ? testTunnel.localPort : (Number(port) || 5432);
-    const targetDb = default_database || 'postgres';
-    const targetUser = username !== undefined ? username : '';
-    const targetPass = password !== undefined ? String(password) : '';
-    const isSslEnabled = Boolean(ssl);
+  // 2. Real Unified Multi-Driver Connection Test (PostgreSQL, MySQL, SQLite, MSSQL)
+  const targetHost = testTunnel ? '127.0.0.1' : (host || 'localhost');
+  const targetPort = testTunnel
+    ? testTunnel.localPort
+    : (Number(port) || (driver === 'mysql' ? 3306 : driver === 'sqlserver' ? 1433 : 5432));
 
-    const client = new Client({
-      host: targetHost,
-      port: targetPort,
-      user: targetUser,
-      password: targetPass,
-      database: targetDb,
-      ssl: isSslEnabled ? { rejectUnauthorized: false } : false,
-      connectionTimeoutMillis: 7000,
-    });
+  const testConn = {
+    id: 'test',
+    driver,
+    host: targetHost,
+    port: targetPort,
+    username,
+    password,
+    default_database,
+    ssl,
+    ssh_enabled: 0, // already tunneled if needed
+    is_readonly: 0
+  };
 
-    try {
-      await client.connect();
-      const versionRes = await client.query('SELECT version();');
-      await client.end();
-      if (testTunnel) testTunnel.close();
-      const latency = Math.round(performance.now() - startTime);
-      return res.json({
-        success: true,
-        message: `Connected successfully to PostgreSQL at ${host || 'localhost'}:${port || 5432}/${targetDb}${isSslEnabled ? ' (SSL Active)' : ''}${ssh_enabled ? ` via SSH (${ssh_user}@${ssh_host}:${ssh_port || 22})` : ''}`,
-        version: versionRes.rows[0]?.version,
-        latency_ms: latency
-      });
-    } catch (err: unknown) {
-      if (targetPass && targetPass !== targetPass.trim()) {
-        try {
-          const retryClient = new Client({
-            host: targetHost,
-            port: targetPort,
-            user: targetUser,
-            password: targetPass.trim(),
-            database: targetDb,
-            ssl: isSslEnabled ? { rejectUnauthorized: false } : false,
-            connectionTimeoutMillis: 7000,
-          });
-          await retryClient.connect();
-          const versionRes = await retryClient.query('SELECT version();');
-          await retryClient.end();
-          if (testTunnel) testTunnel.close();
-          const latency = Math.round(performance.now() - startTime);
-          return res.json({
-            success: true,
-            message: `Connected successfully! (Note: Leading/trailing space in password was auto-trimmed)`,
-            version: versionRes.rows[0]?.version,
-            latency_ms: latency
-          });
-        } catch {
-          // continue to original error reporting
-        }
-      }
-
-      if (testTunnel) testTunnel.close();
-      const msg = err instanceof Error ? err.message : String(err);
-      return res.status(400).json({
-        success: false,
-        message: `PostgreSQL Connection Failed: ${msg}${targetPass && targetPass !== targetPass.trim() ? ' (Tip: Your DB password contains leading/trailing spaces!)' : ''}`
-      });
-    }
-  }
-
-  if (driver === 'mysql' || driver === 'sqlserver') {
-    const targetHost = testTunnel ? '127.0.0.1' : (host || 'localhost');
-    const targetPort = testTunnel ? testTunnel.localPort : (Number(port) || (driver === 'mysql' ? 3306 : 1433));
-    const tcpCheck = await testTcpConnection(targetHost, targetPort, 4000);
+  try {
+    const adapter = createAdapter(testConn, targetHost, targetPort, default_database);
+    const testRes = await adapter.testConnection();
     if (testTunnel) testTunnel.close();
-    if (!tcpCheck.ok) {
-      return res.status(400).json({
-        success: false,
-        message: `${driver.toUpperCase()} Connection Failed: Could not reach ${targetHost}:${targetPort} (${tcpCheck.error})`
-      });
-    }
-    const latency = Math.round(performance.now() - startTime);
-    return res.json({
-      success: true,
-      message: `Connected successfully to ${driver.toUpperCase()} at ${host || 'localhost'}:${port || 3306}${ssl ? ' (SSL Enabled)' : ''}${ssh_enabled ? ` via SSH (${ssh_user}@${ssh_host}:${ssh_port || 22})` : ''}`,
-      latency_ms: latency
-    });
-  }
 
-  if (driver === 'sqlite') {
+    if (!testRes.success) {
+      return res.status(400).json(testRes);
+    }
+    return res.json(testRes);
+  } catch (err: unknown) {
     if (testTunnel) testTunnel.close();
-    const dbFilePath = default_database || host;
-    if (!dbFilePath) {
-      return res.status(400).json({
-        success: false,
-        message: 'SQLite Connection Failed: Database file path is required.'
-      });
-    }
-    const resolvedPath = dbFilePath.startsWith('~')
-      ? path.join(os.homedir(), dbFilePath.slice(1))
-      : dbFilePath;
-    const dir = path.dirname(resolvedPath);
-    if (!fs.existsSync(dir)) {
-      return res.status(400).json({
-        success: false,
-        message: `SQLite Connection Failed: Directory "${dir}" does not exist.`
-      });
-    }
-    const latency = Math.round(performance.now() - startTime);
-    return res.json({
-      success: true,
-      message: `SQLite database file verified at "${resolvedPath}".`,
-      latency_ms: latency
+    const msg = err instanceof Error ? err.message : String(err);
+    return res.status(400).json({
+      success: false,
+      message: `${driver.toUpperCase()} Connection Failed: ${msg}`,
+      latency_ms: Math.round(performance.now() - startTime)
     });
   }
-
-  const latency = Math.round(performance.now() - startTime);
-  return res.json({
-    success: true,
-    message: `Connected successfully to ${driver} at ${host}:${port}`,
-    latency_ms: latency
-  });
 });
 
-// 3. Real PostgreSQL Databases Tree
+// 3. Databases Tree (Unified Multi-Driver)
 app.get('/api/connections/:id/databases', async (req, res) => {
   const { id } = req.params;
   const conn = getConnectionRecord(id);
-  const defaultDb = (conn.default_database as string) || 'postgres';
+  const defaultDb = getDefaultDatabase(conn.driver as string, conn.default_database as string);
 
   try {
-    const pool = await getPgPool(conn, defaultDb);
-    const result = await pool.query('SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;');
-    const databases = result.rows.map(r => r.datname);
-
+    const adapter = await getAdapter(conn, defaultDb, getOrCreateTunnel);
+    const databases = await adapter.listDatabases();
     res.json({
-      current: defaultDb,
-      databases: databases.length > 0 ? databases : [defaultDb]
+      current: defaultDb || databases[0] || 'default',
+      databases: databases.length > 0 ? databases : [defaultDb || 'default']
     });
   } catch (err: unknown) {
     console.error('Error fetching databases:', err);
     res.json({
-      current: defaultDb,
-      databases: [defaultDb]
+      current: defaultDb || 'default',
+      databases: [defaultDb || 'default']
     });
   }
 });
 
-// 4. Real PostgreSQL Schemas & Tables Tree
+// 4. Schemas & Tables Tree (Unified Multi-Driver)
 app.get('/api/connections/:id/schemas', async (req, res) => {
   const { id } = req.params;
   const conn = getConnectionRecord(id);
-  const database = (req.query.database as string) || (conn.default_database as string) || 'postgres';
+  const database = (req.query.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
 
   try {
-    const pool = await getPgPool(conn, database);
-
-    const query = `
-      SELECT
-        t.table_schema as schema,
-        t.table_name as name,
-        COALESCE(c.reltuples::bigint, 0) as "rowCount",
-        (
-          SELECT count(*)::int 
-          FROM information_schema.columns col 
-          WHERE col.table_schema = t.table_schema AND col.table_name = t.table_name
-        ) as "columnsCount"
-      FROM information_schema.tables t
-      LEFT JOIN pg_class c ON c.relname = t.table_name
-      LEFT JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.table_schema
-      WHERE t.table_schema NOT IN ('information_schema', 'pg_catalog')
-        AND t.table_type = 'BASE TABLE'
-      ORDER BY t.table_schema, t.table_name;
-    `;
-    const result = await pool.query(query);
-
-    const schemaGroupsMap = new Map<string, Array<{
-      name: string;
-      schema: string;
-      rowCount: number;
-      columnsCount: number;
-      columns: TableColumn[];
-    }>>();
-
-    let totalEntities = 0;
-    for (const row of result.rows) {
-      totalEntities++;
-      const schemaName = row.schema;
-      if (!schemaGroupsMap.has(schemaName)) {
-        schemaGroupsMap.set(schemaName, []);
-      }
-      schemaGroupsMap.get(schemaName)!.push({
-        name: row.name,
-        schema: row.schema,
-        rowCount: Math.max(0, parseInt(row.rowCount, 10) || 0),
-        columnsCount: row.columnsCount || 0,
-        columns: []
-      });
-    }
-
-    const schemas = Array.from(schemaGroupsMap.entries()).map(([name, tables]) => ({
-      name,
-      tables
-    }));
-
-    res.json({
-      database,
-      totalEntities,
-      schemas
-    });
+    const adapter = await getAdapter(conn, database, getOrCreateTunnel);
+    const result = await adapter.listSchemasAndTables();
+    res.json(result);
   } catch (err: unknown) {
-    console.error(`Error loading schemas for ${database}:`, err);
+    console.error('Error fetching schemas & tables:', err);
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
@@ -872,30 +738,13 @@ app.get('/api/connections/:id/schemas', async (req, res) => {
 app.get('/api/connections/:id/tables/:tableName/columns', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
-  const database = (req.query.database as string) || (conn.default_database as string) || 'postgres';
-  const schema = (req.query.schema as string) || 'public';
+  const database = (req.query.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
+  const schema = (req.query.schema as string) || getDefaultSchema(conn.driver as string, database);
+
   try {
-    const pool = await getPgPool(conn, database);
-    const colQuery = `
-      SELECT 
-        c.column_name as name,
-        c.data_type as type,
-        c.is_nullable = 'YES' as nullable,
-        CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END as "isPrimary"
-      FROM information_schema.columns c
-      LEFT JOIN (
-        SELECT kcu.column_name, kcu.table_schema, kcu.table_name
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-          AND tc.table_schema = kcu.table_schema
-        WHERE tc.constraint_type = 'PRIMARY KEY'
-      ) pk ON c.table_schema = pk.table_schema AND c.table_name = pk.table_name AND c.column_name = pk.column_name
-      WHERE c.table_schema = $1 AND c.table_name = $2
-      ORDER BY c.ordinal_position;
-    `;
-    const colRes = await pool.query(colQuery, [schema, tableName]);
-    res.json({ columns: colRes.rows });
+    const adapter = await getAdapter(conn, database, getOrCreateTunnel);
+    const columns = await adapter.getTableColumns(tableName, schema);
+    res.json({ columns });
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -905,85 +754,13 @@ app.get('/api/connections/:id/tables/:tableName/columns', async (req, res) => {
 app.get('/api/connections/:id/tables/:tableName/ddl', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
-  const database = (req.query.database as string) || (conn.default_database as string) || 'postgres';
-  const schema = (req.query.schema as string) || 'public';
+  const database = (req.query.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
+  const schema = (req.query.schema as string) || getDefaultSchema(conn.driver as string, database);
+
   try {
-    const pool = await getPgPool(conn, database);
-
-    // Columns detail with data types, nullability, defaults
-    const colSql = `
-      SELECT 
-        c.column_name,
-        c.data_type,
-        c.udt_name,
-        c.character_maximum_length,
-        c.numeric_precision,
-        c.numeric_scale,
-        c.is_nullable,
-        c.column_default
-      FROM information_schema.columns c
-      WHERE c.table_schema = $1 AND c.table_name = $2
-      ORDER BY c.ordinal_position;
-    `;
-    const colRes = await pool.query(colSql, [schema, tableName]);
-    if (colRes.rows.length === 0) {
-      return res.status(404).json({ error: `Table "${tableName}" not found in schema "${schema}".` });
-    }
-
-    // Primary keys
-    const pkSql = `
-      SELECT kcu.column_name
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-        AND tc.table_schema = kcu.table_schema
-      WHERE tc.constraint_type = 'PRIMARY KEY'
-        AND tc.table_schema = $1
-        AND tc.table_name = $2
-      ORDER BY kcu.ordinal_position;
-    `;
-    const pkRes = await pool.query(pkSql, [schema, tableName]);
-    const pkCols = pkRes.rows.map(r => `"${r.column_name}"`);
-
-    // Build CREATE TABLE statement
-    const colDefs = colRes.rows.map(col => {
-      let typeStr = col.data_type;
-      if (col.data_type === 'character varying') {
-        typeStr = col.character_maximum_length ? `VARCHAR(${col.character_maximum_length})` : 'VARCHAR';
-      } else if (col.data_type === 'character') {
-        typeStr = col.character_maximum_length ? `CHAR(${col.character_maximum_length})` : 'CHAR';
-      } else if (col.data_type === 'numeric' && col.numeric_precision) {
-        typeStr = col.numeric_scale ? `NUMERIC(${col.numeric_precision}, ${col.numeric_scale})` : `NUMERIC(${col.numeric_precision})`;
-      } else if (col.data_type === 'USER-DEFINED') {
-        typeStr = col.udt_name.toUpperCase();
-      } else {
-        typeStr = typeStr.toUpperCase();
-      }
-
-      let def = `  "${col.column_name}" ${typeStr}`;
-      if (col.column_default) {
-        def += ` DEFAULT ${col.column_default}`;
-      }
-      if (col.is_nullable === 'NO') {
-        def += ' NOT NULL';
-      }
-      return def;
-    });
-
-    if (pkCols.length > 0) {
-      colDefs.push(`  CONSTRAINT "${tableName}_pkey" PRIMARY KEY (${pkCols.join(', ')})`);
-    }
-
-    const ddl = `-- Table Definition for "${schema}"."${tableName}"\n-- Generated by ${APP_NAME} on ${new Date().toISOString()}\n\nCREATE TABLE "${schema}"."${tableName}" (\n${colDefs.join(',\n')}\n);\n`;
-
-    res.json({
-      success: true,
-      tableName,
-      schema,
-      ddl,
-      columnsCount: colRes.rows.length,
-      primaryKeys: pkRes.rows.map(r => r.column_name)
-    });
+    const adapter = await getAdapter(conn, database, getOrCreateTunnel);
+    const ddl = await adapter.getTableDdl(tableName, schema);
+    res.json({ ddl });
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -991,50 +768,29 @@ app.get('/api/connections/:id/tables/:tableName/ddl', async (req, res) => {
 
 // 4d. Truncate Table Endpoint
 app.post('/api/connections/:id/tables/:tableName/truncate', async (req, res) => {
-  const { id: connectionId, tableName } = req.params;
-  const conn = getConnectionRecord(connectionId);
-  const {
-    database = (conn.default_database as string) || 'postgres',
-    schema = 'public',
-    cascade = false,
-    autocommit = true,
-    sessionId
-  } = req.body;
+  const { id, tableName } = req.params;
+  const conn = getConnectionRecord(id);
+  const database = (req.body.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
+  const schema = (req.body.schema as string) || getDefaultSchema(conn.driver as string, database);
+  const cascade = Boolean(req.body.cascade);
 
   try {
-    const sql = `TRUNCATE TABLE "${schema}"."${tableName}" ${cascade ? 'CASCADE' : ''};`;
-    const { inTransaction, statementCount } = await executeQueryWithSession(
-      connectionId,
-      database,
-      Boolean(autocommit),
-      sessionId,
-      sql,
-      [],
-      sql
-    );
-
-    res.json({
-      success: true,
-      inTransaction,
-      statementCount,
-      message: `Table "${schema}"."${tableName}" truncated successfully.${inTransaction ? ' (In active transaction)' : ''}`
-    });
+    const adapter = await getAdapter(conn, database, getOrCreateTunnel);
+    await adapter.truncateTable(tableName, schema, cascade);
+    res.json({ success: true, message: `Table "${tableName}" truncated successfully.` });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    saveQueryHistory(connectionId, `TRUNCATE TABLE "${tableName}"...`, 'error', 0, 15, msg);
-    res.status(500).json({ error: msg });
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
-// 5. Real PostgreSQL Table Data (Pagination, Filter, Sort)
+// 5. Data Table Rows Browsing (Pagination, Sort, Filter, Search)
 app.get('/api/connections/:id/tables/:tableName/data', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
-  const database = (req.query.database as string) || (conn.default_database as string) || 'postgres';
-  const schema = (req.query.schema as string) || 'public';
+  const database = (req.query.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
+  const schema = (req.query.schema as string) || getDefaultSchema(conn.driver as string, database);
   const page = Math.max(1, parseInt(req.query.page as string || '1', 10));
   const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string || '50', 10)));
-  const offset = (page - 1) * limit;
 
   const filterCol = req.query.filterCol as string | undefined;
   const filterOp = req.query.filterOp as string | undefined;
@@ -1043,245 +799,62 @@ app.get('/api/connections/:id/tables/:tableName/data', async (req, res) => {
   const sortDir = (req.query.sortDir as string)?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
   try {
-    const pool = await getPgPool(conn, database);
-
-    // 1. Column Metadata & Primary Keys
-    const colQuery = `
-      SELECT 
-        c.column_name as name,
-        c.data_type as type,
-        c.is_nullable = 'YES' as nullable,
-        CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END as "isPrimary"
-      FROM information_schema.columns c
-      LEFT JOIN (
-        SELECT kcu.column_name, kcu.table_schema, kcu.table_name
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-          AND tc.table_schema = kcu.table_schema
-        WHERE tc.constraint_type = 'PRIMARY KEY'
-      ) pk ON c.table_schema = pk.table_schema AND c.table_name = pk.table_name AND c.column_name = pk.column_name
-      WHERE c.table_schema = $1 AND c.table_name = $2
-      ORDER BY c.ordinal_position;
-    `;
-    const colRes = await pool.query(colQuery, [schema, tableName]);
-    const columns: TableColumn[] = colRes.rows;
-
-    if (columns.length === 0) {
-      return res.status(404).json({ error: `Table "${tableName}" not found in schema "${schema}".` });
-    }
-
-    // 2. Filter Where Clause
-    const values: any[] = [];
-    let whereClause = '';
-    if (filterCol && filterVal !== undefined && filterVal !== '') {
-      const validCol = columns.find(c => c.name === filterCol);
-      if (validCol) {
-        values.push(filterVal);
-        const idx = values.length;
-        if (filterOp === 'contains') {
-          whereClause = `WHERE "${filterCol}"::text ILIKE '%' || $${idx} || '%'`;
-        } else if (filterOp === 'starts_with') {
-          whereClause = `WHERE "${filterCol}"::text ILIKE $${idx} || '%'`;
-        } else if (filterOp === 'gt') {
-          whereClause = `WHERE "${filterCol}" > $${idx}`;
-        } else if (filterOp === 'lt') {
-          whereClause = `WHERE "${filterCol}" < $${idx}`;
-        } else {
-          whereClause = `WHERE "${filterCol}"::text = $${idx}`;
-        }
-      }
-    }
-
-    // 3. Count Total
-    const countSql = `SELECT count(*)::bigint as total FROM "${schema}"."${tableName}" ${whereClause}`;
-    const countRes = await pool.query(countSql, values);
-    const total = parseInt(countRes.rows[0]?.total, 10) || 0;
-
-    // 4. Order Clause
-    let orderClause = '';
-    if (sortCol) {
-      const validSort = columns.find(c => c.name === sortCol);
-      if (validSort) {
-        orderClause = `ORDER BY "${validSort.name}" ${sortDir}`;
-      }
-    } else {
-      const pkCol = columns.find(c => c.isPrimary);
-      if (pkCol) {
-        orderClause = `ORDER BY "${pkCol.name}" ASC`;
-      }
-    }
-
-    // 5. Fetch Rows
-    const dataSql = `
-      SELECT * FROM "${schema}"."${tableName}"
-      ${whereClause}
-      ${orderClause}
-      LIMIT $${values.length + 1} OFFSET $${values.length + 2}
-    `;
-    const dataRes = await pool.query(dataSql, [...values, limit, offset]);
-
-    res.json({
-      database,
-      schema,
-      tableName,
-      columns,
-      rows: dataRes.rows,
+    const adapter = await getAdapter(conn, database, getOrCreateTunnel);
+    const result = await adapter.getTableData(tableName, schema, {
       page,
       limit,
-      total,
-      totalPages: Math.ceil(total / limit)
+      filterCol,
+      filterOp,
+      filterVal,
+      sortCol,
+      sortDir
     });
+    res.json(result);
   } catch (err: unknown) {
     console.error(`Error loading table data for ${tableName}:`, err);
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
-interface TransactionStatement {
-  id: string;
-  query: string;
-  timestamp: string;
-  duration_ms: number;
-  rowCount: number;
-  status: 'pending' | 'success' | 'error';
-  errorMessage?: string;
-}
-
-interface CompletedTransaction {
-  id: string;
-  connectionId: string;
-  database: string;
-  startedAt: string;
-  endedAt: string;
-  action: 'committed' | 'rolled_back';
-  durationMs: number;
-  statementCount: number;
-  statements: TransactionStatement[];
-}
-
-interface SessionTx {
-  client: pg.PoolClient;
-  connectionId: string;
-  database: string;
-  inTransaction: boolean;
-  startedAt: number;
-  lastActive: number;
-  statements: TransactionStatement[];
-}
-
-const activeSessions = new Map<string, SessionTx>();
-const transactionHistoryList: CompletedTransaction[] = [];
-
-// Shared transaction runner: executes in transaction session if autocommit is disabled
-async function executeQueryWithSession(
-  connectionId: string,
-  database: string,
-  autocommit: boolean,
-  sessionId: string | undefined,
-  sql: string,
-  values: unknown[],
-  displaySql?: string
-): Promise<{ result: pg.QueryResult; inTransaction: boolean; statementCount?: number }> {
-  const conn = getConnectionRecord(connectionId);
-  const isProd = conn.environment === 'production';
-  const effectiveAutocommit = isProd ? false : autocommit;
-
-  const pool = await getPgPool(conn, database);
-  const startTime = performance.now();
-
-  if (effectiveAutocommit) {
-    const result = await pool.query(sql, values);
-    const duration = Math.round(performance.now() - startTime);
-    saveQueryHistory(connectionId, displaySql || sql, 'success', result.rowCount || 1, duration, null);
-    return { result, inTransaction: false };
-  }
-
-  // Manual commit mode: Use or create active transaction session
-  const sessionKey = sessionId || `${connectionId}_${database}`;
-  let session = activeSessions.get(sessionKey);
-
-  if (!session) {
-    const client = await pool.connect();
-    await client.query('BEGIN;');
-    session = {
-      client,
-      connectionId,
-      database,
-      inTransaction: true,
-      startedAt: Date.now(),
-      lastActive: Date.now(),
-      statements: []
-    };
-    activeSessions.set(sessionKey, session);
-  }
-
-  const result = await session.client.query(sql, values);
-  session.lastActive = Date.now();
-  const duration = Math.round(performance.now() - startTime);
-  const rowCount = result.rowCount !== null ? result.rowCount : (result.rows ? result.rows.length : 1);
-
-  const logQuery = displaySql || sql;
-  session.statements.push({
-    id: `stmt-${Date.now()}-${session.statements.length + 1}`,
-    query: logQuery,
-    timestamp: new Date().toISOString(),
-    duration_ms: duration,
-    rowCount,
-    status: 'pending'
-  });
-
-  saveQueryHistory(connectionId, logQuery, 'success', rowCount, duration, null);
-  return { result, inTransaction: true, statementCount: session.statements.length };
-}
-
 // 6. Insert Row (Create)
 app.post('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
   const conn = getConnectionRecord(connectionId);
   const {
-    database = (conn.default_database as string) || 'postgres',
-    schema = 'public',
+    database: reqDatabase,
+    schema: reqSchema,
     rowData,
     autocommit = true,
     sessionId
   } = req.body;
 
+  const database = reqDatabase || getDefaultDatabase(conn.driver as string, conn.default_database as string);
+  const schema = reqSchema || getDefaultSchema(conn.driver as string, database);
+
   if (!rowData || typeof rowData !== 'object') {
     return res.status(400).json({ error: 'Missing rowData object.' });
   }
 
+  const isProd = conn.environment === 'production';
+  const effectiveAutocommit = isProd ? false : Boolean(autocommit);
+  const sessionKey = sessionId || `${connectionId}_${database}`;
+
   try {
-    const keys = Object.keys(rowData).filter(k => rowData[k] !== undefined && rowData[k] !== '');
-    if (keys.length === 0) {
-      return res.status(400).json({ error: 'No column values provided to insert.' });
+    const adapter = await getAdapter(conn, database, getOrCreateTunnel);
+    let session: TransactionSession | undefined;
+    if (!effectiveAutocommit) {
+      session = await getOrCreateSession(adapter, connectionId, database, sessionKey);
     }
 
-    const colsSql = keys.map(k => `"${k}"`).join(', ');
-    const paramsSql = keys.map((_, i) => `$${i + 1}`).join(', ');
-    const values = keys.map(k => rowData[k]);
+    const { row, rowCount } = await adapter.insertRow(tableName, schema, rowData, session);
+    const inTransaction = !effectiveAutocommit;
+    const statementCount = session ? session.statements.length : undefined;
 
-    const sql = `INSERT INTO "${schema}"."${tableName}" (${colsSql}) VALUES (${paramsSql}) RETURNING *;`;
-
-    const displayVals = keys.map(k => {
-      const v = rowData[k];
-      return v === null ? 'NULL' : typeof v === 'number' ? v : `'${String(v).replace(/'/g, "''")}'`;
-    }).join(', ');
-    const displaySql = `INSERT INTO "${schema}"."${tableName}" (${colsSql}) VALUES (${displayVals});`;
-
-    const { result, inTransaction, statementCount } = await executeQueryWithSession(
-      connectionId,
-      database,
-      Boolean(autocommit),
-      sessionId,
-      sql,
-      values,
-      displaySql
-    );
+    saveQueryHistory(connectionId, `INSERT INTO "${tableName}"...`, 'success', rowCount, 10, null);
 
     res.json({
       success: true,
-      row: result.rows[0],
+      row,
       inTransaction,
       statementCount,
       message: inTransaction
@@ -1300,8 +873,8 @@ app.put('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
   const conn = getConnectionRecord(connectionId);
   const {
-    database = (conn.default_database as string) || 'postgres',
-    schema = 'public',
+    database: reqDatabase,
+    schema: reqSchema,
     identifierColumn,
     identifierValue,
     updatedData,
@@ -1309,43 +882,40 @@ app.put('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
     sessionId
   } = req.body;
 
+  const database = reqDatabase || getDefaultDatabase(conn.driver as string, conn.default_database as string);
+  const schema = reqSchema || getDefaultSchema(conn.driver as string, database);
+
   if (!identifierColumn || identifierValue === undefined || !updatedData) {
     return res.status(400).json({ error: 'Missing identifierColumn, identifierValue, or updatedData.' });
   }
 
+  const isProd = conn.environment === 'production';
+  const effectiveAutocommit = isProd ? false : Boolean(autocommit);
+  const sessionKey = sessionId || `${connectionId}_${database}`;
+
   try {
-    const keys = Object.keys(updatedData);
-    if (keys.length === 0) {
-      return res.status(400).json({ error: 'No updated fields provided.' });
+    const adapter = await getAdapter(conn, database, getOrCreateTunnel);
+    let session: TransactionSession | undefined;
+    if (!effectiveAutocommit) {
+      session = await getOrCreateSession(adapter, connectionId, database, sessionKey);
     }
 
-    const setParts = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');
-    const values = keys.map(k => updatedData[k]);
-    values.push(identifierValue);
-    const idParamIdx = values.length;
-
-    const sql = `UPDATE "${schema}"."${tableName}" SET ${setParts} WHERE "${identifierColumn}" = $${idParamIdx} RETURNING *;`;
-
-    const displaySetParts = keys.map(k => {
-      const v = updatedData[k];
-      return `"${k}" = ${v === null ? 'NULL' : typeof v === 'number' ? v : `'${String(v).replace(/'/g, "''")}'`}`;
-    }).join(', ');
-    const displayIdVal = typeof identifierValue === 'number' ? identifierValue : `'${String(identifierValue).replace(/'/g, "''")}'`;
-    const displaySql = `UPDATE "${schema}"."${tableName}" SET ${displaySetParts} WHERE "${identifierColumn}" = ${displayIdVal};`;
-
-    const { result, inTransaction, statementCount } = await executeQueryWithSession(
-      connectionId,
-      database,
-      Boolean(autocommit),
-      sessionId,
-      sql,
-      values,
-      displaySql
+    const { updatedRow, rowCount } = await adapter.updateRow(
+      tableName,
+      schema,
+      identifierColumn,
+      identifierValue,
+      updatedData,
+      session
     );
+    const inTransaction = !effectiveAutocommit;
+    const statementCount = session ? session.statements.length : undefined;
+
+    saveQueryHistory(connectionId, `UPDATE "${tableName}"...`, 'success', rowCount, 10, null);
 
     res.json({
       success: true,
-      updatedRow: result.rows[0],
+      updatedRow,
       inTransaction,
       statementCount,
       message: inTransaction
@@ -1364,32 +934,37 @@ app.delete('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
   const conn = getConnectionRecord(connectionId);
   const {
-    database = (conn.default_database as string) || 'postgres',
-    schema = 'public',
+    database: reqDatabase,
+    schema: reqSchema,
     identifierColumn,
     identifierValue,
     autocommit = true,
     sessionId
   } = req.body;
 
+  const database = reqDatabase || getDefaultDatabase(conn.driver as string, conn.default_database as string);
+  const schema = reqSchema || getDefaultSchema(conn.driver as string, database);
+
   if (!identifierColumn || identifierValue === undefined) {
     return res.status(400).json({ error: 'Missing identifierColumn or identifierValue.' });
   }
 
-  try {
-    const sql = `DELETE FROM "${schema}"."${tableName}" WHERE "${identifierColumn}" = $1;`;
-    const displayIdVal = typeof identifierValue === 'number' ? identifierValue : `'${String(identifierValue).replace(/'/g, "''")}'`;
-    const displaySql = `DELETE FROM "${schema}"."${tableName}" WHERE "${identifierColumn}" = ${displayIdVal};`;
+  const isProd = conn.environment === 'production';
+  const effectiveAutocommit = isProd ? false : Boolean(autocommit);
+  const sessionKey = sessionId || `${connectionId}_${database}`;
 
-    const { result, inTransaction, statementCount } = await executeQueryWithSession(
-      connectionId,
-      database,
-      Boolean(autocommit),
-      sessionId,
-      sql,
-      [identifierValue],
-      displaySql
-    );
+  try {
+    const adapter = await getAdapter(conn, database, getOrCreateTunnel);
+    let session: TransactionSession | undefined;
+    if (!effectiveAutocommit) {
+      session = await getOrCreateSession(adapter, connectionId, database, sessionKey);
+    }
+
+    const { rowCount } = await adapter.deleteRow(tableName, schema, identifierColumn, identifierValue, session);
+    const inTransaction = !effectiveAutocommit;
+    const statementCount = session ? session.statements.length : undefined;
+
+    saveQueryHistory(connectionId, `DELETE FROM "${tableName}"...`, 'success', rowCount, 10, null);
 
     res.json({
       success: true,
@@ -1397,7 +972,7 @@ app.delete('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
       statementCount,
       message: inTransaction
         ? `Deleted row from "${tableName}" (Transaction active). Statement recorded in Transaction Log.`
-        : `Deleted ${result.rowCount} row(s) from "${tableName}".`
+        : `Deleted ${rowCount} row(s) from "${tableName}".`
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1406,7 +981,7 @@ app.delete('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   }
 });
 
-// 9. Real SQL Query Execution (SQL Editor) with Manual Commit & Rollback Support
+// 9. Real SQL Query Execution (SQL Editor) with Multi-Driver & Manual Commit / Rollback Support
 app.post('/api/query', async (req, res) => {
   const startTime = performance.now();
   const {
@@ -1428,17 +1003,18 @@ app.post('/api/query', async (req, res) => {
   }
 
   const conn = getConnectionRecord(connectionId);
-  const targetDb = database || (conn.default_database as string) || 'postgres';
+  const targetDb = database || getDefaultDatabase(conn.driver as string, conn.default_database as string);
   const sessionKey = sessionId || connectionId || 'default';
-  const pool = await getPgPool(conn, targetDb);
+  const isProd = conn.environment === 'production';
+  const effectiveAutocommit = isProd ? false : Boolean(autocommit);
 
   // 1. Explicit COMMIT statement
   if (/^COMMIT(\s*;)?$/i.test(trimmed)) {
     const session = activeSessions.get(sessionKey);
     if (session) {
       try {
-        await session.client.query('COMMIT;');
-        session.client.release();
+        await session.commit();
+        await session.release();
         activeSessions.delete(sessionKey);
 
         transactionHistoryList.unshift({
@@ -1465,7 +1041,7 @@ app.post('/api/query', async (req, res) => {
           rows: []
         });
       } catch (err: any) {
-        try { session.client.release(true); } catch { }
+        try { await session.release(); } catch { }
         activeSessions.delete(sessionKey);
         saveQueryHistory(connectionId, trimmed, 'error', 0, Math.round(performance.now() - startTime), err.message);
         return res.status(500).json({
@@ -1496,8 +1072,8 @@ app.post('/api/query', async (req, res) => {
     const session = activeSessions.get(sessionKey);
     if (session) {
       try {
-        await session.client.query('ROLLBACK;');
-        session.client.release();
+        await session.rollback();
+        await session.release();
         activeSessions.delete(sessionKey);
 
         transactionHistoryList.unshift({
@@ -1524,7 +1100,7 @@ app.post('/api/query', async (req, res) => {
           rows: []
         });
       } catch (err: any) {
-        try { session.client.release(true); } catch { }
+        try { await session.release(); } catch { }
         activeSessions.delete(sessionKey);
         saveQueryHistory(connectionId, trimmed, 'error', 0, Math.round(performance.now() - startTime), err.message);
         return res.status(500).json({
@@ -1551,85 +1127,46 @@ app.post('/api/query', async (req, res) => {
   }
 
   // 3. Manual Commit Mode (Autocommit is FALSE or Production)
-  if (!autocommit) {
-    let session = activeSessions.get(sessionKey);
-
-    if (!session) {
-      try {
-        const client = await pool.connect();
-        await client.query('BEGIN;');
-        session = {
-          client,
-          connectionId,
-          database,
-          inTransaction: true,
-          startedAt: Date.now(),
-          lastActive: Date.now(),
-          statements: []
-        };
-        activeSessions.set(sessionKey, session);
-      } catch (err: any) {
-        return res.status(500).json({
-          success: false,
-          error: err.message,
-          message: `Failed to begin transaction session: ${err.message}`,
-          inTransaction: false
-        });
-      }
-    }
-
+  if (!effectiveAutocommit) {
     try {
-      const result = await session.client.query(trimmed);
-      session.lastActive = Date.now();
+      const adapter = await getAdapter(conn, targetDb, getOrCreateTunnel);
+      let session = activeSessions.get(sessionKey);
+      if (!session) {
+        session = await adapter.createTransactionSession(sessionKey);
+        activeSessions.set(sessionKey, session);
+      }
+
+      const result = await session.query(trimmed);
       const duration = Math.round(performance.now() - startTime);
 
-      const columns: TableColumn[] = (result.fields || []).map((f: { name: string }) => ({
-        name: f.name,
-        type: 'text',
-        nullable: true
-      }));
-
-      const rows = result.rows || [];
-      const rowCount = result.rowCount !== null ? result.rowCount : rows.length;
-
-      // Track statement in active session
-      session.statements.push({
-        id: `stmt-${Date.now()}-${session.statements.length + 1}`,
-        query: trimmed,
-        timestamp: new Date().toISOString(),
-        duration_ms: duration,
-        rowCount,
-        status: 'pending'
-      });
-
-      saveQueryHistory(connectionId, trimmed, 'success', rowCount, duration, null);
+      saveQueryHistory(connectionId, trimmed, 'success', result.rowCount, duration, null);
 
       return res.json({
         success: true,
-        message: `Executed in transaction (${rowCount} rows affected). Click Commit to persist or Rollback to discard.`,
+        message: `Executed in transaction (${result.rowCount} rows affected). Click Commit to persist or Rollback to discard.`,
         duration_ms: duration,
         inTransaction: true,
         statementCount: session.statements.length,
-        rowCount,
-        columns,
-        rows
+        rowCount: result.rowCount,
+        columns: result.columns,
+        rows: result.rows
       });
     } catch (err: any) {
       const duration = Math.round(performance.now() - startTime);
       const message = err.message || 'Database error occurred during query execution.';
-      const sqlState = err.code || '42000';
-      const hint = err.hint || (err.position ? `Syntax error near character position ${err.position}` : undefined);
-      const line = err.line ? parseInt(err.line, 10) : undefined;
 
-      session.statements.push({
-        id: `stmt-${Date.now()}-${session.statements.length + 1}`,
-        query: trimmed,
-        timestamp: new Date().toISOString(),
-        duration_ms: duration,
-        rowCount: 0,
-        status: 'error',
-        errorMessage: message
-      });
+      const session = activeSessions.get(sessionKey);
+      if (session) {
+        session.statements.push({
+          id: `stmt-${Date.now()}-${session.statements.length + 1}`,
+          query: trimmed,
+          timestamp: new Date().toISOString(),
+          duration_ms: duration,
+          rowCount: 0,
+          status: 'error',
+          errorMessage: message
+        });
+      }
 
       saveQueryHistory(connectionId, trimmed, 'error', 0, duration, message);
 
@@ -1637,12 +1174,9 @@ app.post('/api/query', async (req, res) => {
         success: false,
         error: message,
         message,
-        sqlState,
-        hint,
-        line,
         duration_ms: duration,
-        inTransaction: true, // Keep in transaction so user can choose to ROLLBACK
-        statementCount: session.statements.length,
+        inTransaction: true,
+        statementCount: session ? session.statements.length : 0,
         rowCount: 0,
         columns: [],
         rows: []
@@ -1650,46 +1184,35 @@ app.post('/api/query', async (req, res) => {
     }
   }
 
-  // 4. Autocommit is TRUE - Execute standard query on pool
+  // 4. Autocommit is TRUE - Execute standard query
   if (activeSessions.has(sessionKey)) {
     const oldSession = activeSessions.get(sessionKey)!;
     try {
-      await oldSession.client.query('COMMIT;');
-      oldSession.client.release();
+      await oldSession.commit();
+      await oldSession.release();
     } catch { }
     activeSessions.delete(sessionKey);
   }
 
   try {
-    const result = await pool.query(trimmed);
+    const adapter = await getAdapter(conn, targetDb, getOrCreateTunnel);
+    const result = await adapter.executeQuery(trimmed);
     const duration = Math.round(performance.now() - startTime);
 
-    const columns: TableColumn[] = (result.fields || []).map((f: { name: string }) => ({
-      name: f.name,
-      type: 'text',
-      nullable: true
-    }));
-
-    const rows = result.rows || [];
-    const rowCount = result.rowCount !== null ? result.rowCount : rows.length;
-
-    saveQueryHistory(connectionId, trimmed, 'success', rowCount, duration, null);
+    saveQueryHistory(connectionId, trimmed, 'success', result.rowCount, duration, null);
 
     return res.json({
       success: true,
-      message: `Query executed successfully (${rowCount} rows affected).`,
+      message: result.message || `Query executed successfully (${result.rowCount} rows affected).`,
       duration_ms: duration,
       inTransaction: false,
-      rowCount,
-      columns,
-      rows
+      rowCount: result.rowCount,
+      columns: result.columns,
+      rows: result.rows
     });
   } catch (err: any) {
     const duration = Math.round(performance.now() - startTime);
     const message = err.message || 'Database error occurred during query execution.';
-    const sqlState = err.code || '42000';
-    const hint = err.hint || (err.position ? `Syntax error near character position ${err.position}` : undefined);
-    const line = err.line ? parseInt(err.line, 10) : undefined;
 
     saveQueryHistory(connectionId, trimmed, 'error', 0, duration, message);
 
@@ -1697,9 +1220,6 @@ app.post('/api/query', async (req, res) => {
       success: false,
       error: message,
       message,
-      sqlState,
-      hint,
-      line,
       duration_ms: duration,
       inTransaction: false,
       rowCount: 0,
@@ -1718,8 +1238,8 @@ app.post('/api/transaction/commit', async (req, res) => {
     return res.json({ success: true, message: 'No active transaction to commit.', inTransaction: false });
   }
   try {
-    await session.client.query('COMMIT;');
-    session.client.release();
+    await session.commit();
+    await session.release();
     activeSessions.delete(sessionKey);
 
     transactionHistoryList.unshift({
@@ -1738,7 +1258,7 @@ app.post('/api/transaction/commit', async (req, res) => {
     saveQueryHistory(connectionId, 'COMMIT', 'success', 0, 5, null);
     res.json({ success: true, message: 'Transaction committed successfully. Changes persisted.', inTransaction: false });
   } catch (err: any) {
-    try { session.client.release(true); } catch { }
+    try { await session.release(); } catch { }
     activeSessions.delete(sessionKey);
     res.status(500).json({ error: err.message, inTransaction: false });
   }
@@ -1753,8 +1273,8 @@ app.post('/api/transaction/rollback', async (req, res) => {
     return res.json({ success: true, message: 'No active transaction to rollback.', inTransaction: false });
   }
   try {
-    await session.client.query('ROLLBACK;');
-    session.client.release();
+    await session.rollback();
+    await session.release();
     activeSessions.delete(sessionKey);
 
     transactionHistoryList.unshift({
@@ -1773,7 +1293,7 @@ app.post('/api/transaction/rollback', async (req, res) => {
     saveQueryHistory(connectionId, 'ROLLBACK', 'success', 0, 5, null);
     res.json({ success: true, message: 'Transaction rolled back successfully. Pending changes discarded.', inTransaction: false });
   } catch (err: any) {
-    try { session.client.release(true); } catch { }
+    try { await session.release(); } catch { }
     activeSessions.delete(sessionKey);
     res.status(500).json({ error: err.message, inTransaction: false });
   }

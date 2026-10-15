@@ -2,7 +2,7 @@
   "name": "bbdb-manager",
   "description": "BBDB Manager - Modern Beekeeper-like Database Studio",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -21,6 +21,7 @@
   "dependencies": {
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.3.3",
+    "@types/mssql": "^12.3.0",
     "@types/pg": "^8.23.1",
     "@vitejs/plugin-react": "^6.1.1",
     "clsx": "^2.1.1",
@@ -28,6 +29,8 @@
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "mssql": "^12.7.6",
+    "mysql2": "^3.24.6",
     "pg": "^8.23.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",

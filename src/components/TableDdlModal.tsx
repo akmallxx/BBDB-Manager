@@ -164,7 +164,7 @@ export function TableDdlModal({
         {/* Footer actions */}
         <div className="px-5 py-3 border-t border-zinc-800 bg-zinc-950/70 flex items-center justify-between shrink-0">
           <span className="text-[11px] text-zinc-500 font-mono">
-            Generated definition complies with PostgreSQL standard
+            Generated DDL definition complies with active database dialect
           </span>
           <div className="flex items-center gap-2">
             {onOpenInEditor && (

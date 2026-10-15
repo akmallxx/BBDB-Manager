@@ -24,6 +24,6 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["src", "scripts", "server.ts", "vite.config.ts"],
+  "include": ["src", "scripts", "server.ts", "server/**/*", "vite.config.ts"],
   "exclude": ["src-tauri", "dist", "node_modules"]
 }

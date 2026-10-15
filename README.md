@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  Database management client for PostgreSQL and SQLite with web and native desktop interfaces.
+  Database management client for PostgreSQL, MySQL / MariaDB, SQLite, and SQL Server (MSSQL) with web and native desktop interfaces.
 </p>
 
 <p align="center">
@@ -29,7 +29,7 @@ BBDB Manager provides an interface for querying, modifying, and managing relatio
 ## Features
 
 ### Connection Management
-- Database drivers: PostgreSQL and SQLite.
+- Database drivers: PostgreSQL, MySQL / MariaDB, SQLite, and SQL Server (MSSQL).
 - Network security: SSL encryption and SSH tunneling (password or private key with passphrase).
 - Environment tagging: Label connections as Development, Staging, or Production with color indicators.
 - Read-only mode: Enforceable read-only toggle to prevent write operations.
@@ -86,7 +86,7 @@ BBDB Manager provides an interface for querying, modifying, and managing relatio
 ## Tech Stack
 
 - Frontend: React 19, TypeScript, Vite, Tailwind CSS v4, Lucide Icons
-- Backend: Express.js, node-postgres (`pg`), ssh2, node:sqlite
+- Backend: Express.js, node-postgres (`pg`), `mysql2`, `node:sqlite`, `mssql`, ssh2
 - Desktop: Tauri v2 (Rust) with bundled standalone Bun binary sidecar
 - Runtimes: Node.js (via `tsx`) and Bun
 
