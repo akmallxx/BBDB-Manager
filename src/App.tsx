@@ -9,6 +9,7 @@ import { SqlEditorView } from './components/SqlEditorView';
 import { TransactionLogModal } from './components/TransactionLogModal';
 import { ToastProvider, useToast } from './components/ui/toast';
 import { APP_NAME } from './lib/config';
+import { cn } from './lib/utils';
 
 function AppContent() {
   const { success, error, info } = useToast();
@@ -19,6 +20,66 @@ function AppContent() {
 
   // Navigation rail view
   const [railView, setRailView] = useState<RailView>('connections');
+
+  // Sidebar Width & Visibility State (persisted via localStorage)
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('bbdb_sidebar_width');
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        if (!isNaN(parsed) && parsed >= 180 && parsed <= 800) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return 260;
+  });
+
+  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('bbdb_sidebar_open');
+      if (saved !== null) {
+        return saved === 'true';
+      }
+    } catch {
+      // ignore
+    }
+    return true;
+  });
+
+  const [isResizing, setIsResizing] = useState(false);
+
+  const setSidebarOpenState = useCallback((open: boolean) => {
+    setIsSidebarOpen(open);
+    try {
+      localStorage.setItem('bbdb_sidebar_open', String(open));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const toggleSidebar = useCallback(() => {
+    setIsSidebarOpen(prev => {
+      const next = !prev;
+      try {
+        localStorage.setItem('bbdb_sidebar_open', String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
+  const handleRailViewChange = useCallback((view: RailView) => {
+    if (isSidebarOpen && railView === view) {
+      setSidebarOpenState(false);
+    } else {
+      setRailView(view);
+      setSidebarOpenState(true);
+    }
+  }, [isSidebarOpen, railView, setSidebarOpenState]);
 
   // Theme settings (persisted via JSON)
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
@@ -299,25 +360,28 @@ function AppContent() {
     }
   };
 
-  // Open Table Tab
+  // Open Table Tab & automatically direct sidebar to entities
   const handleOpenTable = (tableName: string, schemaName: string) => {
     const existing = tabs.find(t => t.type === 'table_data' && t.tableName === tableName);
     if (existing) {
       setActiveTabId(existing.id);
-      return;
+    } else {
+      const newTab: WorkspaceTab = {
+        id: `tab-tbl-${Date.now()}-${tableName}`,
+        type: 'table_data',
+        title: tableName,
+        connectionId: activeConnection?.id,
+        tableName,
+        schemaName
+      };
+
+      setTabs(prev => [...prev, newTab]);
+      setActiveTabId(newTab.id);
     }
 
-    const newTab: WorkspaceTab = {
-      id: `tab-tbl-${Date.now()}-${tableName}`,
-      type: 'table_data',
-      title: tableName,
-      connectionId: activeConnection?.id,
-      tableName,
-      schemaName
-    };
-
-    setTabs(prev => [...prev, newTab]);
-    setActiveTabId(newTab.id);
+    // Auto-focus sidebar to entities and ensure sidebar is opened
+    setRailView('entities');
+    setSidebarOpenState(true);
   };
 
   // Open New Query Tab
@@ -352,20 +416,83 @@ function AppContent() {
       const nextTabs = prevTabs.filter(t => t.id !== id);
       setActiveTabId(prevActiveId => {
         if (prevActiveId === id) {
-          return nextTabs[nextTabs.length - 1].id;
+          const nextActiveTab = nextTabs[nextTabs.length - 1];
+          if (nextActiveTab?.type === 'table_data' && activeConnection) {
+            setRailView('entities');
+          }
+          return nextActiveTab.id;
         }
         return prevActiveId;
       });
       return nextTabs;
     });
+  }, [activeConnection]);
+
+  // Tab Selection with automatic entities redirection when selecting a table tab
+  const handleSelectTab = useCallback((tabId: string) => {
+    setActiveTabId(tabId);
+    const target = tabs.find(t => t.id === tabId);
+    if (target?.type === 'table_data' && activeConnection) {
+      setRailView('entities');
+      setSidebarOpenState(true);
+    }
+  }, [tabs, activeConnection, setSidebarOpenState]);
+
+  // Sidebar drag resizer mouse handlers
+  const handleMouseDownResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setIsResizing(true);
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const deltaX = moveEvent.clientX - startX;
+      const minWidth = 180;
+      const maxWidth = Math.min(800, window.innerWidth * 0.6);
+      const newWidth = Math.max(minWidth, Math.min(maxWidth, startWidth + deltaX));
+      setSidebarWidth(newWidth);
+    };
+
+    const handleMouseUp = (upEvent: MouseEvent) => {
+      setIsResizing(false);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      const deltaX = upEvent.clientX - startX;
+      const minWidth = 180;
+      const maxWidth = Math.min(800, window.innerWidth * 0.6);
+      const finalWidth = Math.max(minWidth, Math.min(maxWidth, startWidth + deltaX));
+      try {
+        localStorage.setItem('bbdb_sidebar_width', String(finalWidth));
+      } catch {
+        // ignore
+      }
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  }, [sidebarWidth]);
+
+  const handleResetSidebarWidth = useCallback(() => {
+    setSidebarWidth(260);
+    try {
+      localStorage.setItem('bbdb_sidebar_width', '260');
+    } catch {
+      // ignore
+    }
   }, []);
 
   // Global Keyboard Shortcuts:
   // 1. Ctrl + Shift + Q: Disconnect
   // 2. Alt + T / Ctrl + Alt + T / Ctrl + Shift + N: New Query Tab (no browser clash)
   // 3. Ctrl + W / Cmd + W / Alt + W / Ctrl + Shift + W: Close Active Tab
+  // 4. Ctrl + B / Cmd + B: Toggle Sidebar Visibility
   useEffect(() => {
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'b' || e.code === 'KeyB')) {
+        e.preventDefault();
+        toggleSidebar();
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key.toLowerCase() === 'q' || e.code === 'KeyQ')) {
         e.preventDefault();
         handleDisconnect();
@@ -394,7 +521,7 @@ function AppContent() {
     };
     window.addEventListener('keydown', handleGlobalKeyDown);
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
-  }, [handleDisconnect, handleNewQueryTab, handleCloseTab]);
+  }, [handleDisconnect, handleNewQueryTab, handleCloseTab, toggleSidebar]);
 
   // Manual Commit / Autocommit Controls
   const handleToggleAutocommit = () => {
@@ -479,11 +606,18 @@ function AppContent() {
   const activeSelectedConnection = connections.find(c => c.id === selectedConnectionId);
 
   return (
-    <div className={`w-screen h-screen flex flex-row overflow-hidden ${theme === 'dark' ? 'dark bg-zinc-950 text-zinc-100' : 'bg-zinc-100 text-zinc-900'}`}>
+    <div
+      className={cn(
+        'w-screen h-screen flex flex-row overflow-hidden',
+        isResizing && 'cursor-col-resize select-none',
+        theme === 'dark' ? 'dark bg-zinc-950 text-zinc-100' : 'bg-zinc-100 text-zinc-900'
+      )}
+    >
       {/* 1. Left Navigation Rail (Image #3 & #5 far left) */}
       <NavigationRail
         currentView={railView}
-        onViewChange={setRailView}
+        isSidebarOpen={isSidebarOpen}
+        onViewChange={handleRailViewChange}
         onNewQuery={() => handleNewQueryTab()}
         theme={theme}
         onToggleTheme={toggleTheme}
@@ -494,65 +628,83 @@ function AppContent() {
       />
 
       {/* 2. Sidebar Drawer (Connections list, Entities tree, or History) */}
-      <SidebarDrawer
-        currentView={railView}
-        connections={connections}
-        activeConnectionId={activeConnection?.id}
-        selectedConnectionId={selectedConnectionId}
-        onSelectConnection={(id) => {
-          setSelectedConnectionId(id);
-          const connToEdit = connections.find(c => c.id === id);
-          const editTabId = `tab-conn-edit-${id}`;
-          const existingEditTab = tabs.find(t => t.id === editTabId || (t.type === 'connection_form' && t.connectionId === id));
-          if (existingEditTab) {
-            setActiveTabId(existingEditTab.id);
-          } else {
-            const editTab: WorkspaceTab = {
-              id: editTabId,
-              type: 'connection_form',
-              title: connToEdit ? `Edit: ${connToEdit.name}` : 'Edit Connection',
-              connectionId: id
-            };
-            setTabs(prev => [...prev, editTab]);
-            setActiveTabId(editTabId);
-          }
-          setRailView('connections');
-        }}
-        onConnectConnection={handleConnect}
-        onNewConnectionClick={() => {
-          setSelectedConnectionId(undefined);
-          const existingNewTab = tabs.find(t => t.type === 'connection_form' && !t.connectionId);
-          if (existingNewTab) {
-            setActiveTabId(existingNewTab.id);
-          } else {
-            const newTabId = `tab-conn-new-${Date.now()}`;
-            const newTab: WorkspaceTab = {
-              id: newTabId,
-              type: 'connection_form',
-              title: 'New Connection'
-            };
-            setTabs(prev => [...prev, newTab]);
-            setActiveTabId(newTabId);
-          }
-          setRailView('connections');
-        }}
-        onDeleteConnection={handleDeleteConnection}
-        onDuplicateConnection={handleDuplicateConnection}
-        onDisconnect={handleDisconnect}
-        activeDatabase={activeDatabase}
-        databasesList={databasesList}
-        onChangeDatabase={handleChangeDatabase}
-        schemas={schemas}
-        totalEntities={totalEntities}
-        onRefreshSchemas={() => activeConnection && fetchSchemas(activeConnection.id, activeDatabase)}
-        onOpenTable={handleOpenTable}
-        activeTableName={activeTab.tableName}
-        history={history}
-        onRefreshHistory={loadHistory}
-        onClearHistory={handleClearHistory}
-        onSelectHistoryItem={(q) => handleNewQueryTab(q)}
-        onOpenQueryTab={(q) => handleNewQueryTab(q)}
-      />
+      {isSidebarOpen && (
+        <>
+          <SidebarDrawer
+            width={sidebarWidth}
+            currentView={railView}
+            connections={connections}
+            activeConnectionId={activeConnection?.id}
+            selectedConnectionId={selectedConnectionId}
+            onSelectConnection={(id) => {
+              setSelectedConnectionId(id);
+              const connToEdit = connections.find(c => c.id === id);
+              const editTabId = `tab-conn-edit-${id}`;
+              const existingEditTab = tabs.find(t => t.id === editTabId || (t.type === 'connection_form' && t.connectionId === id));
+              if (existingEditTab) {
+                setActiveTabId(existingEditTab.id);
+              } else {
+                const editTab: WorkspaceTab = {
+                  id: editTabId,
+                  type: 'connection_form',
+                  title: connToEdit ? `Edit: ${connToEdit.name}` : 'Edit Connection',
+                  connectionId: id
+                };
+                setTabs(prev => [...prev, editTab]);
+                setActiveTabId(editTabId);
+              }
+              setRailView('connections');
+            }}
+            onConnectConnection={handleConnect}
+            onNewConnectionClick={() => {
+              setSelectedConnectionId(undefined);
+              const existingNewTab = tabs.find(t => t.type === 'connection_form' && !t.connectionId);
+              if (existingNewTab) {
+                setActiveTabId(existingNewTab.id);
+              } else {
+                const newTabId = `tab-conn-new-${Date.now()}`;
+                const newTab: WorkspaceTab = {
+                  id: newTabId,
+                  type: 'connection_form',
+                  title: 'New Connection'
+                };
+                setTabs(prev => [...prev, newTab]);
+                setActiveTabId(newTabId);
+              }
+              setRailView('connections');
+            }}
+            onDeleteConnection={handleDeleteConnection}
+            onDuplicateConnection={handleDuplicateConnection}
+            onDisconnect={handleDisconnect}
+            activeDatabase={activeDatabase}
+            databasesList={databasesList}
+            onChangeDatabase={handleChangeDatabase}
+            schemas={schemas}
+            totalEntities={totalEntities}
+            onRefreshSchemas={() => activeConnection && fetchSchemas(activeConnection.id, activeDatabase)}
+            onOpenTable={handleOpenTable}
+            activeTableName={activeTab.tableName}
+            history={history}
+            onRefreshHistory={loadHistory}
+            onClearHistory={handleClearHistory}
+            onSelectHistoryItem={(q) => handleNewQueryTab(q)}
+            onOpenQueryTab={(q) => handleNewQueryTab(q)}
+          />
+
+          {/* Resizer Splitter Handle */}
+          <div
+            onMouseDown={handleMouseDownResize}
+            onDoubleClick={handleResetSidebarWidth}
+            title="Drag to resize sidebar • Double-click to reset"
+            className={cn(
+              "relative w-1 hover:w-1 active:w-1 h-full cursor-col-resize select-none shrink-0 transition-all z-20 group",
+              isResizing ? "bg-yellow-400 w-0.5" : "bg-transparent hover:bg-yellow-400/80"
+            )}
+          >
+            <div className="absolute inset-y-0 -left-1 -right-1" />
+          </div>
+        </>
+      )}
 
       {/* 3. Main Workspace Area */}
       <div className="flex-1 flex flex-col h-full min-w-0 bg-zinc-950 overflow-hidden">
@@ -560,7 +712,7 @@ function AppContent() {
         <TabBar
           tabs={tabs}
           activeTabId={activeTabId}
-          onSelectTab={setActiveTabId}
+          onSelectTab={handleSelectTab}
           onCloseTab={handleCloseTab}
           onNewQueryTab={() => handleNewQueryTab()}
           autocommit={autocommit}

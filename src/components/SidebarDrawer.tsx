@@ -37,6 +37,8 @@ interface SidebarDrawerProps {
   onRefreshHistory: () => void;
   onClearHistory: () => void;
   onSelectHistoryItem: (query: string) => void;
+  // Sizing
+  width?: number;
 }
 
 export function SidebarDrawer({
@@ -62,7 +64,8 @@ export function SidebarDrawer({
   history,
   onRefreshHistory,
   onClearHistory,
-  onSelectHistoryItem
+  onSelectHistoryItem,
+  width
 }: SidebarDrawerProps) {
   const { success, error, info } = useToast();
 
@@ -248,7 +251,13 @@ export function SidebarDrawer({
   };
 
   return (
-    <aside className="w-64 h-screen bg-zinc-900 border-r border-zinc-800 flex flex-col shrink-0 select-none overflow-hidden">
+    <aside
+      style={{ width: width ? `${width}px` : undefined }}
+      className={cn(
+        'h-screen bg-zinc-900 border-r border-zinc-800 flex flex-col shrink-0 select-none overflow-hidden',
+        !width && 'w-64'
+      )}
+    >
       {/* =========================================================================
           VIEW 1: CONNECTIONS LIST (Matches Beekeeper Image #2)
       ========================================================================== */}

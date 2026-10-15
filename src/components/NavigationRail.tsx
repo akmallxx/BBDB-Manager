@@ -6,6 +6,7 @@ export type RailView = 'connections' | 'entities' | 'history';
 
 interface NavigationRailProps {
   currentView: RailView;
+  isSidebarOpen?: boolean;
   onViewChange: (view: RailView) => void;
   onNewQuery: () => void;
   theme: 'dark' | 'light';
@@ -18,6 +19,7 @@ interface NavigationRailProps {
 
 export function NavigationRail({
   currentView,
+  isSidebarOpen = true,
   onViewChange,
   onNewQuery,
   theme,
@@ -42,15 +44,15 @@ export function NavigationRail({
         {/* Connections View Button */}
         <button
           onClick={() => onViewChange('connections')}
-          title="Connections"
+          title={isSidebarOpen && currentView === 'connections' ? 'Connections (Click to collapse)' : 'Connections (Click to open)'}
           className={cn(
             'relative w-8 h-8 rounded flex items-center justify-center transition-colors cursor-pointer',
-            currentView === 'connections'
+            isSidebarOpen && currentView === 'connections'
               ? 'text-zinc-100 bg-zinc-800/90'
               : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900'
           )}
         >
-          {currentView === 'connections' && (
+          {isSidebarOpen && currentView === 'connections' && (
             <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-yellow-400 rounded-r" />
           )}
           <Monitor className="w-4 h-4" />
@@ -60,16 +62,22 @@ export function NavigationRail({
         <button
           onClick={() => onViewChange('entities')}
           disabled={!hasActiveConnection}
-          title={hasActiveConnection ? `Entities (${activeConnectionName})` : 'Connect to a database first'}
+          title={
+            !hasActiveConnection
+              ? 'Connect to a database first'
+              : isSidebarOpen && currentView === 'entities'
+              ? `Entities (${activeConnectionName}) (Click to collapse)`
+              : `Entities (${activeConnectionName}) (Click to open)`
+          }
           className={cn(
             'relative w-8 h-8 rounded flex items-center justify-center transition-colors cursor-pointer',
             !hasActiveConnection && 'opacity-40 cursor-not-allowed',
-            currentView === 'entities'
+            isSidebarOpen && currentView === 'entities'
               ? 'text-zinc-100 bg-zinc-800/90'
               : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900'
           )}
         >
-          {currentView === 'entities' && (
+          {isSidebarOpen && currentView === 'entities' && (
             <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-yellow-400 rounded-r" />
           )}
           <Database className="w-4 h-4" />
@@ -91,15 +99,15 @@ export function NavigationRail({
         {/* Query History Button */}
         <button
           onClick={() => onViewChange('history')}
-          title="Query History"
+          title={isSidebarOpen && currentView === 'history' ? 'Query History (Click to collapse)' : 'Query History (Click to open)'}
           className={cn(
             'relative w-8 h-8 rounded flex items-center justify-center transition-colors cursor-pointer',
-            currentView === 'history'
+            isSidebarOpen && currentView === 'history'
               ? 'text-zinc-100 bg-zinc-800/90'
               : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900'
           )}
         >
-          {currentView === 'history' && (
+          {isSidebarOpen && currentView === 'history' && (
             <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-yellow-400 rounded-r" />
           )}
           <History className="w-4 h-4" />
