@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
@@ -8,6 +9,20 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import pg from 'pg';
 import { Client as SSHClient, type ConnectConfig } from 'ssh2';
+import { WebSocketServer } from 'ws';
+import { setupSshTerminalWebSocket, createSshClient, type SshConnectionConfig, normalizeSshConfig } from './server/ssh-service.ts';
+import {
+  getOrCreateSftpSession,
+  withSftpSession,
+  listRemoteDirectory,
+  readRemoteFile,
+  writeRemoteFile,
+  makeRemoteDirectory,
+  deleteRemoteItem,
+  renameRemoteItem,
+  chmodRemoteItem,
+  closeSftpSession
+} from './server/sftp-service.ts';
 import {
   getAdapter,
   createAdapter,
@@ -67,7 +82,8 @@ function testTcpConnection(host: string, port: number, timeoutMs = 4000): Promis
 }
 
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const DEFAULT_BACKEND_PORT = 39001;
+const PORT = parseInt(process.env.PORT || process.env.VITE_BACKEND_PORT || process.env.BACKEND_PORT || String(DEFAULT_BACKEND_PORT), 10);
 const APP_NAME = process.env.VITE_APP_NAME || process.env.APP_NAME || 'BBDB Manager';
 
 app.use((req, res, next) => {
@@ -105,30 +121,7 @@ try {
   }
 }
 
-// 1. JSON Theme Configuration
-const themeConfigPath = path.join(dataDir, 'theme-config.json');
-if (!fs.existsSync(themeConfigPath)) {
-  fs.writeFileSync(
-    themeConfigPath,
-    JSON.stringify({ theme: 'dark', fontSize: 13, autocommitDefault: true }, null, 2),
-    'utf-8'
-  );
-}
-
-function getThemeConfig() {
-  try {
-    const raw = fs.readFileSync(themeConfigPath, 'utf-8');
-    return JSON.parse(raw);
-  } catch {
-    return { theme: 'dark', fontSize: 13, autocommitDefault: true };
-  }
-}
-
-function saveThemeConfig(config: Record<string, unknown>) {
-  fs.writeFileSync(themeConfigPath, JSON.stringify(config, null, 2), 'utf-8');
-}
-
-// 2. SQLite Database for Studio Connections & Query History
+// 1. SQLite Database for Studio Connections, Query History, Snippets & Settings
 const dbPath = path.join(dataDir, 'database-studio.sqlite');
 const studioDb = new DatabaseSync(dbPath);
 
@@ -155,6 +148,7 @@ studioDb.exec(`
     color TEXT DEFAULT '#06b6d4',
     is_readonly INTEGER DEFAULT 0,
     environment TEXT DEFAULT 'development',
+    connection_mode TEXT DEFAULT 'database',
     created_at TEXT NOT NULL
   );
 
@@ -168,13 +162,108 @@ studioDb.exec(`
     error_message TEXT,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS terminal_snippets (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    command TEXT NOT NULL,
+    tags TEXT,
+    is_favorite INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `);
 
-// Add migrations for older DB schemas
+// Add backward-compatible migrations for existing SQLite schemas
 try { studioDb.exec('ALTER TABLE connections ADD COLUMN ssh_password TEXT;'); } catch { }
 try { studioDb.exec('ALTER TABLE connections ADD COLUMN ssh_key_file TEXT;'); } catch { }
 try { studioDb.exec('ALTER TABLE connections ADD COLUMN ssh_key_passphrase TEXT;'); } catch { }
 try { studioDb.exec("ALTER TABLE connections ADD COLUMN environment TEXT DEFAULT 'development';"); } catch { }
+try { studioDb.exec("ALTER TABLE connections ADD COLUMN connection_mode TEXT DEFAULT 'database';"); } catch { }
+
+// Application Settings Management via SQLite
+function getAppSetting(key: string, defaultValue = ''): string {
+  try {
+    const row = studioDb.prepare('SELECT value FROM app_settings WHERE key = ?').get(key) as { value: string } | undefined;
+    return row ? row.value : defaultValue;
+  } catch {
+    return defaultValue;
+  }
+}
+
+function setAppSetting(key: string, value: string): void {
+  try {
+    const now = new Date().toISOString();
+    studioDb.prepare(`
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(key, value, now);
+  } catch (err) {
+    console.error(`Failed to set setting "${key}":`, err);
+  }
+}
+
+function getAllAppSettings(): Record<string, string> {
+  try {
+    const rows = studioDb.prepare('SELECT key, value FROM app_settings').all() as { key: string; value: string }[];
+    const result: Record<string, string> = {};
+    for (const r of rows) {
+      result[r.key] = r.value;
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+// Migrate legacy theme-config.json to SQLite app_settings if it exists
+function initAppSettings() {
+  const themeConfigPath = path.join(dataDir, 'theme-config.json');
+  let migratedTheme = 'dark';
+  let migratedFontSize = '13';
+  let migratedAutocommit = 'true';
+
+  if (fs.existsSync(themeConfigPath)) {
+    try {
+      const raw = fs.readFileSync(themeConfigPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed.theme) migratedTheme = String(parsed.theme);
+      if (parsed.fontSize) migratedFontSize = String(parsed.fontSize);
+      if (parsed.autocommitDefault !== undefined) migratedAutocommit = String(parsed.autocommitDefault);
+      fs.unlinkSync(themeConfigPath);
+      console.log('Migrated theme-config.json into SQLite app_settings table and removed JSON file.');
+    } catch (e) {
+      console.warn('Failed to parse legacy theme-config.json:', e);
+    }
+  }
+
+  if (!getAppSetting('theme')) setAppSetting('theme', migratedTheme);
+  if (!getAppSetting('fontSize')) setAppSetting('fontSize', migratedFontSize);
+  if (!getAppSetting('autocommitDefault')) setAppSetting('autocommitDefault', migratedAutocommit);
+}
+
+initAppSettings();
+
+function getThemeConfig() {
+  return {
+    theme: getAppSetting('theme', 'dark'),
+    fontSize: parseInt(getAppSetting('fontSize', '13'), 10),
+    autocommitDefault: getAppSetting('autocommitDefault', 'true') === 'true'
+  };
+}
+
+function saveThemeConfig(config: Record<string, unknown>) {
+  if (config.theme !== undefined) setAppSetting('theme', String(config.theme));
+  if (config.fontSize !== undefined) setAppSetting('fontSize', String(config.fontSize));
+  if (config.autocommitDefault !== undefined) setAppSetting('autocommitDefault', String(config.autocommitDefault));
+}
 
 function saveQueryHistory(
   connectionId: string,
@@ -424,7 +513,7 @@ async function getOrCreateSession(
   return session;
 }
 
-function getConnectionRecord(connId?: string): Record<string, unknown> {
+function getConnectionRecord(connId?: string): Record<string, unknown> | null {
   if (connId) {
     const row = studioDb.prepare('SELECT * FROM connections WHERE id = ?').get(connId);
     if (row) {
@@ -434,40 +523,58 @@ function getConnectionRecord(connId?: string): Record<string, unknown> {
       };
     }
   }
-  const defaultRow = studioDb.prepare('SELECT * FROM connections LIMIT 1').get();
-  if (defaultRow) {
-    return {
-      ...(defaultRow as Record<string, unknown>),
-      environment: ((defaultRow as Record<string, unknown>).environment as string) || 'development'
-    };
-  }
-
-  return {
-    id: connId || 'default',
-    name: 'New Connection',
-    driver: 'postgresql',
-    host: 'localhost',
-    port: 5432,
-    username: 'postgres',
-    password: '',
-    default_database: 'postgres',
-    ssl: 0,
-    environment: 'development'
-  };
+  return null;
 }
 
 // ==========================================
 // REST API ROUTES
 // ==========================================
 
-// 1. Theme Configuration
+// 1. Settings & Theme Configuration (SQLite app_settings)
+app.get('/api/settings', (_req, res) => {
+  res.json(getAllAppSettings());
+});
+
+app.post('/api/settings', (req, res) => {
+  if (req.body && typeof req.body === 'object') {
+    for (const [k, v] of Object.entries(req.body)) {
+      setAppSetting(k, String(v));
+    }
+  }
+  res.json({ success: true, settings: getAllAppSettings() });
+});
+
+app.get('/api/settings/info', (_req, res) => {
+  try {
+    const connCount = (studioDb.prepare('SELECT count(*) as c FROM connections').get() as { c: number })?.c || 0;
+    const historyCount = (studioDb.prepare('SELECT count(*) as c FROM query_history').get() as { c: number })?.c || 0;
+    const snippetsCount = (studioDb.prepare('SELECT count(*) as c FROM terminal_snippets').get() as { c: number })?.c || 0;
+    let dbSizeBytes = 0;
+    try {
+      dbSizeBytes = fs.statSync(dbPath).size;
+    } catch { }
+
+    res.json({
+      dbPath,
+      dbSizeBytes,
+      connectionsCount: connCount,
+      historyCount,
+      snippetsCount,
+      appVersion: '1.1.0'
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
 app.get('/api/theme', (_req, res) => {
   res.json(getThemeConfig());
 });
 
 app.post('/api/theme', (req, res) => {
   saveThemeConfig(req.body);
-  res.json({ success: true, theme: req.body });
+  res.json({ success: true, theme: getThemeConfig() });
 });
 
 // 2. Saved Database Connections (SQLite)
@@ -503,7 +610,8 @@ app.post('/api/connections', (req, res) => {
       ssh_key_passphrase = '',
       color = '#06b6d4',
       is_readonly = 0,
-      environment = 'development'
+      environment = 'development',
+      connection_mode = 'database'
     } = req.body;
 
     const id = `conn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -513,15 +621,15 @@ app.post('/api/connections', (req, res) => {
       INSERT INTO connections (
         id, name, driver, host, port, username, password, default_database,
         ssl, ssh_enabled, ssh_host, ssh_port, ssh_user, ssh_auth_method,
-        ssh_password, ssh_key_file, ssh_key_passphrase, color, is_readonly, environment, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ssh_password, ssh_key_file, ssh_key_passphrase, color, is_readonly, environment, connection_mode, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
       id, name, driver, host, port, username, password, default_database,
       ssl ? 1 : 0, ssh_enabled ? 1 : 0, ssh_host, ssh_port, ssh_user,
       ssh_auth_method, ssh_password, ssh_key_file, ssh_key_passphrase,
-      color, is_readonly ? 1 : 0, environment, created_at
+      color, is_readonly ? 1 : 0, environment, connection_mode, created_at
     );
 
     const newConn = studioDb.prepare('SELECT * FROM connections WHERE id = ?').get(id);
@@ -539,7 +647,7 @@ app.put('/api/connections/:id', (req, res) => {
       name, driver, host, port, username, password, default_database,
       ssl, ssh_enabled, ssh_host, ssh_port, ssh_user, ssh_auth_method,
       ssh_password = '', ssh_key_file = '', ssh_key_passphrase = '',
-      color, is_readonly, environment = 'development'
+      color, is_readonly, environment = 'development', connection_mode = 'database'
     } = req.body;
 
     const stmt = studioDb.prepare(`
@@ -548,7 +656,7 @@ app.put('/api/connections/:id', (req, res) => {
         default_database = ?, ssl = ?, ssh_enabled = ?, ssh_host = ?,
         ssh_port = ?, ssh_user = ?, ssh_auth_method = ?,
         ssh_password = ?, ssh_key_file = ?, ssh_key_passphrase = ?,
-        color = ?, is_readonly = ?, environment = ?
+        color = ?, is_readonly = ?, environment = ?, connection_mode = ?
       WHERE id = ?
     `);
 
@@ -556,7 +664,7 @@ app.put('/api/connections/:id', (req, res) => {
       name, driver, host, port, username, password, default_database,
       ssl ? 1 : 0, ssh_enabled ? 1 : 0, ssh_host, ssh_port, ssh_user,
       ssh_auth_method, ssh_password, ssh_key_file, ssh_key_passphrase,
-      color, is_readonly ? 1 : 0, environment, id
+      color, is_readonly ? 1 : 0, environment, connection_mode, id
     );
 
     closeTunnel(id);
@@ -574,6 +682,106 @@ app.delete('/api/connections/:id', (req, res) => {
     closeTunnel(id);
     studioDb.prepare('DELETE FROM connections WHERE id = ?').run(id);
     res.json({ success: true, id });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+// Terminal Snippets Endpoints
+app.get('/api/snippets', (req, res) => {
+  try {
+    const { tag, search } = req.query;
+    let query = 'SELECT * FROM terminal_snippets';
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+
+    if (tag && typeof tag === 'string') {
+      conditions.push('LOWER(tags) LIKE ?');
+      params.push(`%${tag.toLowerCase()}%`);
+    }
+
+    if (search && typeof search === 'string') {
+      conditions.push('(LOWER(title) LIKE ? OR LOWER(command) LIKE ? OR LOWER(tags) LIKE ?)');
+      const s = `%${search.toLowerCase()}%`;
+      params.push(s, s, s);
+    }
+
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+
+    query += ' ORDER BY is_favorite DESC, created_at DESC';
+
+    const stmt = studioDb.prepare(query);
+    const rows = stmt.all(...params);
+    res.json(rows);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+app.post('/api/snippets', (req, res) => {
+  try {
+    const { title = null, command, tags = null, is_favorite = 0 } = req.body;
+    if (!command || typeof command !== 'string' || !command.trim()) {
+      return res.status(400).json({ error: 'Command is required' });
+    }
+
+    const id = `snip-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const now = new Date().toISOString();
+
+    const stmt = studioDb.prepare(`
+      INSERT INTO terminal_snippets (id, title, command, tags, is_favorite, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(id, title || null, command.trim(), tags || null, is_favorite ? 1 : 0, now, now);
+
+    const created = studioDb.prepare('SELECT * FROM terminal_snippets WHERE id = ?').get(id);
+    res.status(201).json(created);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+app.put('/api/snippets/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const existing = studioDb.prepare('SELECT * FROM terminal_snippets WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!existing) {
+      return res.status(404).json({ error: 'Snippet not found' });
+    }
+
+    const title = (req.body.title !== undefined ? req.body.title : existing.title) as string | null;
+    const command = (req.body.command !== undefined ? req.body.command : existing.command) as string;
+    const tags = (req.body.tags !== undefined ? req.body.tags : existing.tags) as string | null;
+    const is_favorite = req.body.is_favorite !== undefined ? (req.body.is_favorite ? 1 : 0) : (Number(existing.is_favorite) || 0);
+    const now = new Date().toISOString();
+
+    const stmt = studioDb.prepare(`
+      UPDATE terminal_snippets
+      SET title = ?, command = ?, tags = ?, is_favorite = ?, updated_at = ?
+      WHERE id = ?
+    `);
+
+    stmt.run(title, command, tags, is_favorite, now, id);
+
+    const updated = studioDb.prepare('SELECT * FROM terminal_snippets WHERE id = ?').get(id);
+    res.json(updated);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+app.delete('/api/snippets/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    studioDb.prepare('DELETE FROM terminal_snippets WHERE id = ?').run(id);
+    res.json({ ok: true, id });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: msg });
@@ -603,6 +811,36 @@ app.post('/api/connections/test', async (req, res) => {
 
   const startTime = performance.now();
   let testTunnel: SshTunnelInstance | null = null;
+
+  // 0. Direct SSH Host Connection Test (CLI & SFTP)
+  if (driver === 'ssh' || req.body.connection_mode === 'ssh' || req.body.is_ssh_only) {
+    const sshCfg = normalizeSshConfig(req.body, {
+      host: host || ssh_host,
+      port: Number(port || ssh_port) || 22,
+      username: username || ssh_user,
+      password: password || ssh_password,
+      keyFile: ssh_key_file,
+      passphrase: ssh_key_passphrase,
+      authMethod: (ssh_auth_method || 'password') as 'password' | 'key'
+    });
+
+    try {
+      const client = await createSshClient(sshCfg);
+      client.end();
+      const latency = Math.round(performance.now() - startTime);
+      return res.json({
+        success: true,
+        message: `SSH handshake succeeded with ${sshCfg.username}@${sshCfg.host}:${sshCfg.port}`,
+        latency_ms: latency
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return res.status(400).json({
+        success: false,
+        message: `SSH Connection Failed: ${msg}`
+      });
+    }
+  }
 
   // 1. Establish Real SSH Tunnel if enabled
   if (ssh_enabled) {
@@ -700,6 +938,9 @@ app.post('/api/connections/test', async (req, res) => {
 app.get('/api/connections/:id/databases', async (req, res) => {
   const { id } = req.params;
   const conn = getConnectionRecord(id);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${id}` });
+  }
   const defaultDb = getDefaultDatabase(conn.driver as string, conn.default_database as string);
 
   try {
@@ -722,6 +963,9 @@ app.get('/api/connections/:id/databases', async (req, res) => {
 app.get('/api/connections/:id/schemas', async (req, res) => {
   const { id } = req.params;
   const conn = getConnectionRecord(id);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${id}` });
+  }
   const database = (req.query.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
 
   try {
@@ -738,6 +982,9 @@ app.get('/api/connections/:id/schemas', async (req, res) => {
 app.get('/api/connections/:id/tables/:tableName/columns', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${id}` });
+  }
   const database = (req.query.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
   const schema = (req.query.schema as string) || getDefaultSchema(conn.driver as string, database);
 
@@ -754,6 +1001,9 @@ app.get('/api/connections/:id/tables/:tableName/columns', async (req, res) => {
 app.get('/api/connections/:id/tables/:tableName/ddl', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${id}` });
+  }
   const database = (req.query.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
   const schema = (req.query.schema as string) || getDefaultSchema(conn.driver as string, database);
 
@@ -770,6 +1020,9 @@ app.get('/api/connections/:id/tables/:tableName/ddl', async (req, res) => {
 app.post('/api/connections/:id/tables/:tableName/truncate', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${id}` });
+  }
   const database = (req.body.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
   const schema = (req.body.schema as string) || getDefaultSchema(conn.driver as string, database);
   const cascade = Boolean(req.body.cascade);
@@ -787,6 +1040,9 @@ app.post('/api/connections/:id/tables/:tableName/truncate', async (req, res) => 
 app.get('/api/connections/:id/tables/:tableName/data', async (req, res) => {
   const { id, tableName } = req.params;
   const conn = getConnectionRecord(id);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${id}` });
+  }
   const database = (req.query.database as string) || getDefaultDatabase(conn.driver as string, conn.default_database as string);
   const schema = (req.query.schema as string) || getDefaultSchema(conn.driver as string, database);
   const page = Math.max(1, parseInt(req.query.page as string || '1', 10));
@@ -820,6 +1076,9 @@ app.get('/api/connections/:id/tables/:tableName/data', async (req, res) => {
 app.post('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
   const conn = getConnectionRecord(connectionId);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${connectionId}` });
+  }
   const {
     database: reqDatabase,
     schema: reqSchema,
@@ -872,6 +1131,9 @@ app.post('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
 app.put('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
   const conn = getConnectionRecord(connectionId);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${connectionId}` });
+  }
   const {
     database: reqDatabase,
     schema: reqSchema,
@@ -933,6 +1195,9 @@ app.put('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
 app.delete('/api/connections/:id/tables/:tableName/rows', async (req, res) => {
   const { id: connectionId, tableName } = req.params;
   const conn = getConnectionRecord(connectionId);
+  if (!conn) {
+    return res.status(404).json({ error: `Connection not found: ${connectionId}` });
+  }
   const {
     database: reqDatabase,
     schema: reqSchema,
@@ -1003,6 +1268,13 @@ app.post('/api/query', async (req, res) => {
   }
 
   const conn = getConnectionRecord(connectionId);
+  if (!conn) {
+    return res.status(404).json({
+      success: false,
+      error: `Connection not found: ${connectionId}`,
+      message: `Connection not found: ${connectionId}`
+    });
+  }
   const targetDb = database || getDefaultDatabase(conn.driver as string, conn.default_database as string);
   const sessionKey = sessionId || connectionId || 'default';
   const isProd = conn.environment === 'production';
@@ -1392,6 +1664,174 @@ app.post('/api/export', (req, res) => {
   res.status(400).json({ error: 'Unsupported export format. Use csv, json, or sql.' });
 });
 
+// ==========================================
+// REMOTE SFTP REST API ENDPOINTS
+// ==========================================
+
+function resolveSshConfigFromReq(req: express.Request): { sessionKey: string; config: SshConnectionConfig } {
+  const connectionId = (req.body?.connectionId || req.query?.connectionId || req.headers?.['x-connection-id']) as string | undefined;
+  const rawConfig = req.body?.config;
+
+  let conn: Record<string, any> | undefined = undefined;
+  if (connectionId) {
+    conn = studioDb.prepare('SELECT * FROM connections WHERE id = ?').get(connectionId) as Record<string, any> | undefined;
+  }
+
+  const config = normalizeSshConfig(conn, rawConfig);
+  if (!config.host || !config.username) {
+    const err: any = new Error('Missing SSH connection details. Provide connectionId or valid host/username.');
+    err.status = 400;
+    throw err;
+  }
+
+  const sessionKey = connectionId
+    ? `conn_${connectionId}`
+    : `custom_${config.username}@${config.host}:${config.port || 22}`;
+
+  return { sessionKey, config };
+}
+
+function handleSftpError(res: express.Response, err: any, fallbackMessage: string) {
+  const status = (typeof err?.status === 'number' && err.status >= 400 && err.status < 600) ? err.status : 500;
+  if (status >= 500) {
+    console.error(`[SFTP Error]`, err);
+  }
+  return res.status(status).json({ error: err?.message || fallbackMessage });
+}
+
+app.post('/api/sftp/list', async (req, res) => {
+  try {
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const targetPath = (req.body.path as string) || '.';
+    const result = await withSftpSession(sessionKey, config, sftp => listRemoteDirectory(sftp, targetPath));
+    res.json(result);
+  } catch (err: any) {
+    handleSftpError(res, err, 'Failed to list remote directory');
+  }
+});
+
+app.post('/api/sftp/read', async (req, res) => {
+  try {
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const filePath = req.body.path as string;
+    if (!filePath) return res.status(400).json({ error: 'path is required' });
+    const result = await withSftpSession(sessionKey, config, sftp => readRemoteFile(sftp, filePath));
+    res.json(result);
+  } catch (err: any) {
+    handleSftpError(res, err, 'Failed to read file');
+  }
+});
+
+app.post('/api/sftp/write', async (req, res) => {
+  try {
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const filePath = req.body.path as string;
+    const content = req.body.content as string;
+    if (!filePath || content === undefined) return res.status(400).json({ error: 'path and content are required' });
+    await withSftpSession(sessionKey, config, sftp => writeRemoteFile(sftp, filePath, content));
+    res.json({ success: true, message: `Saved ${filePath}` });
+  } catch (err: any) {
+    handleSftpError(res, err, 'Failed to write file');
+  }
+});
+
+app.post('/api/sftp/mkdir', async (req, res) => {
+  try {
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const remotePath = req.body.path as string;
+    if (!remotePath) return res.status(400).json({ error: 'path is required' });
+    await withSftpSession(sessionKey, config, sftp => makeRemoteDirectory(sftp, remotePath));
+    res.json({ success: true, message: `Created directory ${remotePath}` });
+  } catch (err: any) {
+    handleSftpError(res, err, 'Failed to create directory');
+  }
+});
+
+app.post('/api/sftp/delete', async (req, res) => {
+  try {
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const remotePath = req.body.path as string;
+    const isDir = Boolean(req.body.isDir);
+    if (!remotePath) return res.status(400).json({ error: 'path is required' });
+    await withSftpSession(sessionKey, config, sftp => deleteRemoteItem(sftp, remotePath, isDir));
+    res.json({ success: true, message: `Deleted ${remotePath}` });
+  } catch (err: any) {
+    handleSftpError(res, err, 'Failed to delete item');
+  }
+});
+
+app.post('/api/sftp/rename', async (req, res) => {
+  try {
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const oldPath = req.body.oldPath as string;
+    const newPath = req.body.newPath as string;
+    if (!oldPath || !newPath) return res.status(400).json({ error: 'oldPath and newPath are required' });
+    await withSftpSession(sessionKey, config, sftp => renameRemoteItem(sftp, oldPath, newPath));
+    res.json({ success: true, message: `Renamed to ${newPath}` });
+  } catch (err: any) {
+    handleSftpError(res, err, 'Failed to rename item');
+  }
+});
+
+app.post('/api/sftp/chmod', async (req, res) => {
+  try {
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const remotePath = req.body.path as string;
+    const mode = typeof req.body.mode === 'string' ? parseInt(req.body.mode, 8) : Number(req.body.mode);
+    if (!remotePath || isNaN(mode)) return res.status(400).json({ error: 'path and valid mode are required' });
+    await withSftpSession(sessionKey, config, sftp => chmodRemoteItem(sftp, remotePath, mode));
+    res.json({ success: true, message: `Permissions updated for ${remotePath}` });
+  } catch (err: any) {
+    handleSftpError(res, err, 'Failed to chmod item');
+  }
+});
+
+app.get('/api/sftp/download', async (req, res) => {
+  try {
+    const filePath = req.query.path as string;
+    if (!filePath) return res.status(400).json({ error: 'path query parameter is required' });
+
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const sftp = await getOrCreateSftpSession(sessionKey, config);
+    const fileName = path.basename(filePath);
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+
+    const stream = sftp.createReadStream(filePath);
+    stream.pipe(res);
+    stream.on('error', (err: any) => {
+      console.error('[SFTP-Download Stream Error]', err);
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+    });
+  } catch (err: any) {
+    handleSftpError(res, err, 'Download failed');
+  }
+});
+
+app.post('/api/sftp/upload', express.raw({ type: '*/*', limit: '100mb' }), async (req, res) => {
+  try {
+    const rawDestPath = req.headers['x-dest-path'] as string;
+    const destPath = rawDestPath ? decodeURIComponent(rawDestPath) : '';
+    if (!destPath) return res.status(400).json({ error: 'x-dest-path header is required' });
+
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const sftp = await getOrCreateSftpSession(sessionKey, config);
+    const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body);
+    await writeRemoteFile(sftp, destPath, buffer);
+    res.json({ success: true, message: `Uploaded to ${destPath}`, bytes: buffer.length });
+  } catch (err: any) {
+    handleSftpError(res, err, 'Upload failed');
+  }
+});
+
+app.post('/api/sftp/disconnect', (req, res) => {
+  const { sessionKey } = req.body || {};
+  if (sessionKey) {
+    closeSftpSession(sessionKey);
+  }
+  res.json({ success: true });
+});
+
 // Vite Integration (Dev Middleware or Production Static)
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production' || isBunCompiled;
@@ -1417,7 +1857,13 @@ async function startServer() {
     }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = http.createServer(app);
+  const wss = new WebSocketServer({ server: httpServer, path: '/api/ssh/ws' });
+  setupSshTerminalWebSocket(wss, (id: string) => {
+    return studioDb.prepare('SELECT * FROM connections WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`${APP_NAME} server listening on http://0.0.0.0:${PORT}`);
   });
 }

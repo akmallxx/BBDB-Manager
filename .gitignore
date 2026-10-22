@@ -9,3 +9,6 @@ coverage/
 src-tauri/target/
 src-tauri/binaries/
 .aistudio/
+
+# Local Agent harness
+.agents/
