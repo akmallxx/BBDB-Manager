@@ -1942,7 +1942,7 @@ app.post('/api/sftp/transfer', async (req, res) => {
     let isAborted = false;
     let currentLocalTargetFile: string | null = null;
 
-    req.on('close', () => {
+    res.on('close', () => {
       if (!res.writableEnded) {
         isAborted = true;
         console.log('[SFTP Transfer] Client connection closed or cancelled by user.');
@@ -1968,7 +1968,7 @@ app.post('/api/sftp/transfer', async (req, res) => {
     await withSftpSession(sessionKey, config, async (sftp) => {
       let itemIndex = 0;
       for (const src of sourcePaths) {
-        if (isAborted || req.destroyed || res.destroyed) {
+        if (isAborted || res.destroyed) {
           console.log('[SFTP Transfer Aborted by client]');
           break;
         }
@@ -2001,7 +2001,7 @@ app.post('/api/sftp/transfer', async (req, res) => {
         };
 
         try {
-          const isAbortedFn = () => isAborted || Boolean(req.destroyed) || Boolean(res.destroyed);
+          const isAbortedFn = () => isAborted || Boolean(res.destroyed);
           if (direction === 'to-remote') {
             await transferLocalItemToRemote(sftp, src, targetDir, onProgress, isAbortedFn);
           } else {
@@ -2017,7 +2017,7 @@ app.post('/api/sftp/transfer', async (req, res) => {
             totalItems
           });
         } catch (itemErr: any) {
-          if (isAborted || req.destroyed || res.destroyed) {
+          if (isAborted || res.destroyed) {
             console.log(`[SFTP Transfer Aborted during ${fileName}]`);
             if (direction === 'to-local' && currentLocalTargetFile && fs.existsSync(currentLocalTargetFile)) {
               try {
@@ -2043,7 +2043,7 @@ app.post('/api/sftp/transfer', async (req, res) => {
       }
     });
 
-    if (isAborted || req.destroyed || res.destroyed) {
+    if (isAborted || res.destroyed) {
       closeSftpSession(sessionKey);
       if (!res.writableEnded && !res.destroyed) {
         res.end();
