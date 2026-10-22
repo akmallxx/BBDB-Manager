@@ -1891,6 +1891,10 @@ app.post('/api/local/rename', async (req, res) => {
 
 // Direct Transfer endpoint (Local <-> Remote SFTP)
 app.post('/api/sftp/transfer', async (req, res) => {
+  // Prevent socket timeout during large file transfers
+  req.setTimeout(0);
+  res.setTimeout(0);
+
   try {
     const { sessionKey, config } = resolveSshConfigFromReq(req);
     const direction = req.body.direction as 'to-remote' | 'to-local';

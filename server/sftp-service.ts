@@ -285,75 +285,62 @@ export function chmodRemoteItem(sftp: SFTPWrapper, remotePath: string, mode: num
 }
 
 /**
- * Transfer a single local file to remote SFTP
+ * High-speed parallel transfer of a single local file to remote SFTP using fastPut
  */
-export function transferLocalFileToRemote(sftp: SFTPWrapper, localFilePath: string, remoteDestPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const readStream = fs.createReadStream(localFilePath);
-    const writeStream = sftp.createWriteStream(remoteDestPath);
+export async function transferLocalFileToRemote(sftp: SFTPWrapper, localFilePath: string, remoteDestPath: string): Promise<void> {
+  const stat = await fs.promises.stat(localFilePath);
+  if (stat.size === 0) {
+    return writeRemoteFile(sftp, remoteDestPath, Buffer.alloc(0));
+  }
 
-    const cleanupAndReject = (err: any) => {
-      if (settled) return;
-      settled = true;
-      try { readStream.destroy(); } catch {}
-      try { writeStream.destroy(); } catch {}
-      reject(err);
+  return new Promise((resolve, reject) => {
+    const options = {
+      concurrency: 64,
+      chunkSize: 32768,
+      mode: stat.mode,
     };
 
-    readStream.on('error', (err: any) => {
-      cleanupAndReject(new Error(`Failed to read local file "${localFilePath}": ${err.message}`));
-    });
-
-    writeStream.on('error', (err: any) => {
-      cleanupAndReject(new Error(`Failed to write remote file "${remoteDestPath}": ${err.message}`));
-    });
-
-    writeStream.on('close', () => {
-      if (settled) return;
-      settled = true;
+    (sftp as any).fastPut(localFilePath, remoteDestPath, options, (err: any) => {
+      if (err) {
+        return reject(new Error(`Failed to upload "${path.basename(localFilePath)}" to remote: ${err.message}`));
+      }
       resolve();
     });
-
-    readStream.pipe(writeStream);
   });
 }
 
 /**
- * Transfer a single remote SFTP file to local filesystem
+ * High-speed parallel transfer of a single remote SFTP file to local filesystem using fastGet
  */
 export function transferRemoteFileToLocal(sftp: SFTPWrapper, remoteFilePath: string, localDestPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    let settled = false;
-    const readStream = sftp.createReadStream(remoteFilePath);
-    const writeStream = fs.createWriteStream(localDestPath);
+    sftp.stat(remoteFilePath, (statErr, stats) => {
+      if (statErr) {
+        return reject(new Error(`Failed to stat remote file "${remoteFilePath}": ${statErr.message}`));
+      }
 
-    const cleanupAndReject = (err: any) => {
-      if (settled) return;
-      settled = true;
-      try { readStream.destroy(); } catch {}
-      try { writeStream.destroy(); } catch {}
-      try {
-        if (fs.existsSync(localDestPath)) fs.unlinkSync(localDestPath);
-      } catch {}
-      reject(err);
-    };
+      if (stats.size === 0) {
+        fs.promises.writeFile(localDestPath, Buffer.alloc(0))
+          .then(() => resolve())
+          .catch((err) => reject(new Error(`Failed to create local file "${localDestPath}": ${err.message}`)));
+        return;
+      }
 
-    readStream.on('error', (err: any) => {
-      cleanupAndReject(new Error(`Failed to read remote file "${remoteFilePath}": ${err.message}`));
+      const options = {
+        concurrency: 64,
+        chunkSize: 32768,
+      };
+
+      (sftp as any).fastGet(remoteFilePath, localDestPath, options, (err: any) => {
+        if (err) {
+          try {
+            if (fs.existsSync(localDestPath)) fs.unlinkSync(localDestPath);
+          } catch {}
+          return reject(new Error(`Failed to download "${path.basename(remoteFilePath)}" to local: ${err.message}`));
+        }
+        resolve();
+      });
     });
-
-    writeStream.on('error', (err: any) => {
-      cleanupAndReject(new Error(`Failed to write local file "${localDestPath}": ${err.message}`));
-    });
-
-    writeStream.on('close', () => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    });
-
-    readStream.pipe(writeStream);
   });
 }
 

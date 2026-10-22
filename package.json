@@ -5,7 +5,7 @@
   "version": "1.3.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx watch server.ts",
     "bun": "bun run server.ts",
     "build": "vite build",
     "build:server": "tsx scripts/build-server.ts",

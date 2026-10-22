@@ -129,6 +129,7 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
 
   // Transfer & Drag State
   const [isTransferring, setIsTransferring] = useState<boolean>(false);
+  const [transferStatus, setTransferStatus] = useState<string | null>(null);
   const [dragOverTarget, setDragOverTarget] = useState<'local' | 'remote' | null>(null);
   const [showHidden, setShowHidden] = useState<boolean>(defaultShowHidden);
 
@@ -285,8 +286,11 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
       return;
     }
 
+    const firstItemName = toTransfer[0]?.split('/').filter(Boolean).pop() || 'item';
+    const desc = toTransfer.length > 1 ? `${firstItemName} and ${toTransfer.length - 1} other item(s)` : `"${firstItemName}"`;
+
     setIsTransferring(true);
-    showToast(`Transferring ${toTransfer.length} item(s) to remote server...`, 'info');
+    setTransferStatus(`Uploading ${desc} to remote server...`);
 
     try {
       const res = await fetch('/api/sftp/transfer', {
@@ -314,6 +318,7 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
       showToast(err.message || 'Transfer failed', 'error');
     } finally {
       setIsTransferring(false);
+      setTransferStatus(null);
     }
   };
 
@@ -324,8 +329,11 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
       return;
     }
 
+    const firstItemName = toTransfer[0]?.split('/').filter(Boolean).pop() || 'item';
+    const desc = toTransfer.length > 1 ? `${firstItemName} and ${toTransfer.length - 1} other item(s)` : `"${firstItemName}"`;
+
     setIsTransferring(true);
-    showToast(`Transferring ${toTransfer.length} item(s) to local machine...`, 'info');
+    setTransferStatus(`Downloading ${desc} to local machine...`);
 
     try {
       const res = await fetch('/api/sftp/transfer', {
@@ -353,6 +361,7 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
       showToast(err.message || 'Transfer failed', 'error');
     } finally {
       setIsTransferring(false);
+      setTransferStatus(null);
     }
   };
 
@@ -1409,6 +1418,17 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Active Transfer Floating Banner */}
+      {transferStatus && (
+        <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-2.5 rounded-xl shadow-2xl border bg-zinc-900 border-sky-500/60 text-xs text-zinc-100 backdrop-blur-md animate-in fade-in slide-in-from-bottom-2">
+          <RefreshCw className="w-4 h-4 text-sky-400 animate-spin shrink-0" />
+          <div className="flex flex-col gap-0.5">
+            <span className="font-semibold text-sky-300">{transferStatus}</span>
+            <span className="text-[10px] text-zinc-400">High-speed parallel SFTP transfer in progress. Please wait...</span>
+          </div>
+        </div>
+      )}
 
       {/* Toast Notification */}
       {transferToast && (
