@@ -74,7 +74,10 @@ BBDB Manager provides an interface for querying, modifying, and managing relatio
 - **xterm.js Terminal Sessions**: Full interactive SSH terminal over WebSockets with font size scaling, cursor styles (block, underline, bar), and zoom controls.
 - **Dynamic Terminal Theming**: Automatic live switching between crisp light and dark terminal backgrounds matching app preferences.
 - **Keepalive Packets**: Periodic background keepalive pings preventing idle connection drops.
-- **SFTP File Browser**: Graphical remote directory tree, file metadata (sizes, permissions octal, timestamps), in-app text editor/viewer, chunked uploads up to 100MB, streaming downloads, and remote chmod.
+- **SFTP File Browser & Dual-Pane Commander**: Graphical twin-panel explorer comparing Local Machine and Remote Server side-by-side (with a 1-click toggle to single-pane view).
+- **Direct Streaming Transfers**: Instant file and directory transfer between local machine and remote SSH server via streaming backend endpoints—no browser download/upload dialogs required.
+- **Drag-and-Drop & Multi-Select**: Drag files/folders between local and remote panels, use checkbox multi-selection for bulk transfers, or use 1-click inline row quick transfer buttons (`➔` and `⬅`).
+- **File Management & Editing**: File metadata inspection (sizes, permissions octal, timestamps), in-app text editor/viewer, remote chmod, file deletion, and recursive directory creation.
 
 ### Terminal Snippets Manager
 - Right-hand collapsible snippet drawer directly inside terminal tabs.

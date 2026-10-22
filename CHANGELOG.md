@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-22
+
+### Added
+- **Side-by-Side (Dual-Pane) SFTP Explorer**:
+  - Twin-panel explorer showing Local Machine on the left and Remote Server on the right for seamless navigation.
+  - View switcher in top toolbar allowing instant toggle between `[ ◫ Side-by-Side ]` and `[ ▭ Remote Only ]` views.
+  - Independent navigation controls for both panes: path input bar, parent directory (`ArrowUp`), home directory (`Home`), refresh (`RefreshCw`), and new folder creation (`FolderPlus`).
+  - Independent search filter bars for quick filtering of local and remote directory entries.
+- **Direct Streaming File & Folder Transfer (No Download/Upload Dialogs)**:
+  - Streaming backend endpoint `/api/sftp/transfer` directly piping streams between local disk and remote SFTP without loading files into memory or opening browser file pickers.
+  - Central action strip with `[ ➔ Transfer to Remote ]` and `[ ⬅ Transfer to Local ]` buttons with live item counters.
+  - 1-click inline row quick transfer buttons (`➔` and `⬅`) on every file and directory row.
+  - Interactive Drag & Drop: drag files or folders directly between Local and Remote panes to initiate transfer with visual drop target highlighting.
+  - Multi-select checkbox support across both panes to batch transfer multiple files and folders at once.
+  - Recursive directory transfer handling for nested folders in both directions (local-to-remote and remote-to-local).
+- **Local Filesystem Service**:
+  - Secure backend service (`server/local-fs-service.ts`) providing directory listing, folder creation, deletion, and renaming for the local machine.
+
 ## [1.2.0] - 2026-10-22
 
 ### Added
