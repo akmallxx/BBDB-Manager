@@ -2001,10 +2001,11 @@ app.post('/api/sftp/transfer', async (req, res) => {
         };
 
         try {
+          const isAbortedFn = () => isAborted || Boolean(req.destroyed) || Boolean(res.destroyed);
           if (direction === 'to-remote') {
-            await transferLocalItemToRemote(sftp, src, targetDir, onProgress);
+            await transferLocalItemToRemote(sftp, src, targetDir, onProgress, isAbortedFn);
           } else {
-            await transferRemoteItemToLocal(sftp, src, targetDir, onProgress);
+            await transferRemoteItemToLocal(sftp, src, targetDir, onProgress, isAbortedFn);
           }
           transferred.push(src);
           currentLocalTargetFile = null;

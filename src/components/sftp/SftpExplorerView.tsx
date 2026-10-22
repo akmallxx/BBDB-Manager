@@ -166,10 +166,13 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
   const [transferToast, setTransferToast] = useState<{ message: string; type: 'info' | 'success' | 'error' } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const transferAbortControllerRef = useRef<AbortController | null>(null);
+  const isMountedRef = useRef<boolean>(true);
 
   // Abort active transfers on component unmount to prevent leaks
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       if (transferAbortControllerRef.current) {
         transferAbortControllerRef.current.abort();
       }
@@ -485,8 +488,10 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
       if (transferAbortControllerRef.current === controller) {
         transferAbortControllerRef.current = null;
       }
-      setIsTransferring(false);
-      setTransferProgress(null);
+      if (isMountedRef.current) {
+        setIsTransferring(false);
+        setTransferProgress(null);
+      }
     }
   };
 

@@ -392,8 +392,10 @@ export async function transferLocalItemToRemote(
   sftp: SFTPWrapper,
   localPath: string,
   remoteDir: string,
-  onProgress?: TransferProgressCallback
+  onProgress?: TransferProgressCallback,
+  isAborted?: () => boolean
 ): Promise<void> {
+  if (isAborted?.()) throw new Error('Transfer cancelled');
   const stat = await fs.promises.stat(localPath);
   const itemName = path.basename(path.resolve(localPath));
   const cleanRemoteDir = remoteDir.endsWith('/') && remoteDir.length > 1 ? remoteDir.slice(0, -1) : remoteDir;
@@ -407,7 +409,8 @@ export async function transferLocalItemToRemote(
     }
     const children = await fs.promises.readdir(localPath);
     for (const child of children) {
-      await transferLocalItemToRemote(sftp, path.join(localPath, child), targetRemotePath, onProgress);
+      if (isAborted?.()) throw new Error('Transfer cancelled');
+      await transferLocalItemToRemote(sftp, path.join(localPath, child), targetRemotePath, onProgress, isAborted);
     }
   } else {
     await transferLocalFileToRemote(sftp, localPath, targetRemotePath, onProgress);
@@ -421,8 +424,10 @@ export async function transferRemoteItemToLocal(
   sftp: SFTPWrapper,
   remotePath: string,
   localDir: string,
-  onProgress?: TransferProgressCallback
+  onProgress?: TransferProgressCallback,
+  isAborted?: () => boolean
 ): Promise<void> {
+  if (isAborted?.()) throw new Error('Transfer cancelled');
   const stat = await new Promise<Stats>((resolve, reject) => {
     sftp.stat(remotePath, (err, stats) => {
       if (err) return reject(err);
@@ -445,9 +450,10 @@ export async function transferRemoteItemToLocal(
       });
     });
     for (const child of list) {
+      if (isAborted?.()) throw new Error('Transfer cancelled');
       if (child.filename === '.' || child.filename === '..') continue;
       const childRemotePath = remotePath.endsWith('/') ? `${remotePath}${child.filename}` : `${remotePath}/${child.filename}`;
-      await transferRemoteItemToLocal(sftp, childRemotePath, targetLocalPath, onProgress);
+      await transferRemoteItemToLocal(sftp, childRemotePath, targetLocalPath, onProgress, isAborted);
     }
   } else {
     await transferRemoteFileToLocal(sftp, remotePath, targetLocalPath, onProgress);
