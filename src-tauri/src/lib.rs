@@ -33,14 +33,30 @@ fn get_data_dir() -> PathBuf {
     p
 }
 
-fn apply_silent_spawn_options(cmd: &mut Command, data_dir: &PathBuf) {
+fn kill_backend() {
+    if let Ok(mut lock) = BACKEND_PROCESS.lock() {
+        if let Some(mut child) = lock.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn apply_silent_spawn_options(cmd: &mut Command, data_dir: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    // Redirect stdout and stderr quietly to backend.log so errors can be inspected without popping up a console
     let log_path = data_dir.join("backend.log");
+    // Rotate log if it exceeds 5 MB to prevent unbounded growth
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            let backup_path = data_dir.join("backend.log.1");
+            let _ = std::fs::rename(&log_path, &backup_path);
+        }
+    }
+
     if let Ok(log_file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -60,22 +76,27 @@ fn apply_silent_spawn_options(cmd: &mut Command, data_dir: &PathBuf) {
         .stderr(Stdio::null());
 }
 
+fn is_executable_for_platform(fname: &str) -> bool {
+    if !fname.starts_with("bbdb-server") {
+        return false;
+    }
+    if fname.ends_with(".d") || fname.ends_with(".pdb") || fname.ends_with(".manifest") || fname.ends_with(".log") {
+        return false;
+    }
+    if cfg!(windows) {
+        fname.ends_with(".exe")
+    } else if cfg!(target_os = "macos") {
+        !fname.ends_with(".exe") && !fname.contains("linux") && !fname.contains("windows")
+    } else {
+        !fname.ends_with(".exe") && !fname.contains("darwin") && !fname.contains("windows")
+    }
+}
+
 fn find_server_binary() -> Option<PathBuf> {
     let exe_extensions: &[&str] = if cfg!(windows) {
         &[".exe", ""]
     } else {
         &[""]
-    };
-
-    let is_valid_binary_name = |fname: &str| -> bool {
-        if !fname.starts_with("bbdb-server") {
-            return false;
-        }
-        if cfg!(windows) {
-            fname.ends_with(".exe")
-        } else {
-            !fname.ends_with(".d") && !fname.ends_with(".pdb") && !fname.contains('.')
-        }
     };
 
     // 1. Check directory containing current running executable (e.g. C:\Program Files\BBDB Manager or /usr/bin/)
@@ -95,7 +116,7 @@ fn find_server_binary() -> Option<PathBuf> {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                            if is_valid_binary_name(fname) {
+                            if is_executable_for_platform(fname) {
                                 return Some(path);
                             }
                         }
@@ -111,7 +132,7 @@ fn find_server_binary() -> Option<PathBuf> {
                         let path = entry.path();
                         if path.is_file() {
                             if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                                if is_valid_binary_name(fname) {
+                                if is_executable_for_platform(fname) {
                                     return Some(path);
                                 }
                             }
@@ -128,7 +149,7 @@ fn find_server_binary() -> Option<PathBuf> {
                         let path = entry.path();
                         if path.is_file() {
                             if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                                if is_valid_binary_name(fname) {
+                                if is_executable_for_platform(fname) {
                                     return Some(path);
                                 }
                             }
@@ -155,34 +176,47 @@ fn find_server_binary() -> Option<PathBuf> {
         }
     }
 
-    // 4. Source tree workspace locations (useful during development / testing)
-    let cwd_candidates = [
-        "src-tauri/binaries/bbdb-server-x86_64-pc-windows-msvc.exe",
-        "binaries/bbdb-server-x86_64-pc-windows-msvc.exe",
-        "src-tauri/binaries/bbdb-server-x86_64-unknown-linux-gnu",
-        "binaries/bbdb-server-x86_64-unknown-linux-gnu",
-        "src-tauri/binaries/bbdb-server-aarch64-apple-darwin",
-        "binaries/bbdb-server-aarch64-apple-darwin",
-        "src-tauri/target/release/bbdb-server.exe",
-        "src-tauri/target/release/bbdb-server",
-        "src-tauri/target/debug/bbdb-server.exe",
-        "src-tauri/target/debug/bbdb-server",
-    ];
-    for rel in &cwd_candidates {
+    // 4. Source tree workspace locations filtered by current target OS
+    let cwd_candidates: &[&str] = if cfg!(windows) {
+        &[
+            "src-tauri/binaries/bbdb-server-x86_64-pc-windows-msvc.exe",
+            "binaries/bbdb-server-x86_64-pc-windows-msvc.exe",
+            "src-tauri/target/release/bbdb-server.exe",
+            "src-tauri/target/debug/bbdb-server.exe",
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "src-tauri/binaries/bbdb-server-aarch64-apple-darwin",
+            "binaries/bbdb-server-aarch64-apple-darwin",
+            "src-tauri/binaries/bbdb-server-x86_64-apple-darwin",
+            "binaries/bbdb-server-x86_64-apple-darwin",
+            "src-tauri/target/release/bbdb-server",
+            "src-tauri/target/debug/bbdb-server",
+        ]
+    } else {
+        &[
+            "src-tauri/binaries/bbdb-server-x86_64-unknown-linux-gnu",
+            "binaries/bbdb-server-x86_64-unknown-linux-gnu",
+            "src-tauri/target/release/bbdb-server",
+            "src-tauri/target/debug/bbdb-server",
+        ]
+    };
+
+    for rel in cwd_candidates {
         let path = PathBuf::from(rel);
         if path.is_file() {
             return Some(path);
         }
     }
 
-    // Also check if src-tauri/binaries or binaries has any bbdb-server*
+    // Also check if src-tauri/binaries or binaries has any valid platform binary
     for dir in &["src-tauri/binaries", "binaries"] {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
                     if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                        if fname.starts_with("bbdb-server") && !fname.ends_with(".d") && !fname.ends_with(".pdb") {
+                        if is_executable_for_platform(fname) {
                             return Some(path);
                         }
                     }
@@ -290,25 +324,21 @@ fn ensure_backend_running() {
 pub fn run() {
     ensure_backend_running();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::Destroyed = event {
-                if let Ok(mut lock) = BACKEND_PROCESS.lock() {
-                    if let Some(mut child) = lock.take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                }
+                kill_backend();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
 
-    // Clean up child process when Tauri window exits
-    if let Ok(mut lock) = BACKEND_PROCESS.lock() {
-        if let Some(mut child) = lock.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            kill_backend();
         }
-    }
+    });
+
+    // Final safeguard
+    kill_backend();
 }
