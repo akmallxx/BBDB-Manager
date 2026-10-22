@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Eye, EyeOff, ChevronDown, ChevronRight, HelpCircle, Link as LinkIcon, Database, Shield, Server, ShieldAlert } from 'lucide-react';
-import { DatabaseConnection, DriverType, ConnectionEnvironment } from '../types/database';
+import { Eye, EyeOff, ChevronDown, ChevronRight, HelpCircle, Link as LinkIcon, Database, Shield, Server, ShieldAlert, Terminal, FolderArchive, Key } from 'lucide-react';
+import { DatabaseConnection, DriverType, ConnectionEnvironment, SshConfigParams } from '../types/database';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Switch } from './ui/switch';
@@ -11,9 +11,12 @@ import { useToast } from './ui/toast';
 
 interface ConnectionViewProps {
   initialConnection?: DatabaseConnection | null;
+  initialMode?: 'database' | 'ssh';
   onConnect: (connection: DatabaseConnection) => void;
   onSave: (connectionData: Partial<DatabaseConnection>) => void;
   onImportUrl?: (url: string) => void;
+  onOpenSsh?: (config: SshConfigParams) => void;
+  onOpenSftp?: (config: SshConfigParams) => void;
 }
 
 const COLOR_PALETTE = [
@@ -29,12 +32,36 @@ const COLOR_PALETTE = [
 
 export function ConnectionView({
   initialConnection,
+  initialMode = 'database',
   onConnect,
-  onSave
+  onSave,
+  onOpenSsh,
+  onOpenSftp
 }: ConnectionViewProps) {
   const { success, error, info } = useToast();
 
-  const [driver, setDriver] = useState<DriverType>('postgresql');
+  const isInitialSsh = Boolean(
+    initialConnection?.connection_mode === 'ssh' ||
+    initialConnection?.driver === 'ssh' ||
+    (initialConnection?.name?.toLowerCase().includes('ssh') && !initialConnection?.default_database)
+  );
+
+  const [connCategory, setConnCategory] = useState<'database' | 'ssh'>(() => {
+    if (isInitialSsh) return 'ssh';
+    return initialMode || 'database';
+  });
+
+  useEffect(() => {
+    if (isInitialSsh) {
+      setConnCategory('ssh');
+    } else if (initialConnection) {
+      setConnCategory('database');
+    } else if (initialMode) {
+      setConnCategory(initialMode);
+    }
+  }, [initialMode, initialConnection, isInitialSsh]);
+
+  const [driver, setDriver] = useState<DriverType>(initialConnection?.driver === 'ssh' ? 'postgresql' : (initialConnection?.driver || 'postgresql'));
   const [authMethod, setAuthMethod] = useState<'password' | 'none'>('password');
   const [connectionMode, setConnectionMode] = useState<'host_port' | 'socket'>('host_port');
   const [host, setHost] = useState(initialConnection?.host || 'localhost');
@@ -108,27 +135,41 @@ export function ConnectionView({
 
   useEffect(() => {
     if (initialConnection) {
-      setDriver(initialConnection.driver);
-      setHost(initialConnection.host || 'localhost');
-      setPort(initialConnection.port || 5432);
-      setUsername(initialConnection.username || '');
-      setPassword(initialConnection.password || '');
-      setDefaultDatabase(initialConnection.default_database || '');
-      setSsl(Boolean(initialConnection.ssl));
-      setSshEnabled(Boolean(initialConnection.ssh_enabled));
-      setSshHost(initialConnection.ssh_host || 'localhost');
-      setSshPort(initialConnection.ssh_port || 22);
-      setSshUser(initialConnection.ssh_user || '');
-      setSshAuthMethod(initialConnection.ssh_auth_method || 'password');
-      setSshPassword(initialConnection.ssh_password || '');
-      setSshKeyFile(initialConnection.ssh_key_file || '');
-      setSshKeyPassphrase(initialConnection.ssh_key_passphrase || '');
+      const isSsh = initialConnection.connection_mode === 'ssh' || initialConnection.driver === 'ssh';
+      if (isSsh) {
+        setConnCategory('ssh');
+        setSshHost(initialConnection.ssh_host || initialConnection.host || 'localhost');
+        setSshPort(initialConnection.ssh_port || initialConnection.port || 22);
+        setSshUser(initialConnection.ssh_user || initialConnection.username || 'root');
+        setSshAuthMethod(initialConnection.ssh_auth_method || 'password');
+        setSshPassword(initialConnection.ssh_password || initialConnection.password || '');
+        setSshKeyFile(initialConnection.ssh_key_file || '');
+        setSshKeyPassphrase(initialConnection.ssh_key_passphrase || '');
+      } else {
+        setConnCategory('database');
+        setDriver(initialConnection.driver);
+        setHost(initialConnection.host || 'localhost');
+        setPort(initialConnection.port || 5432);
+        setUsername(initialConnection.username || '');
+        setPassword(initialConnection.password || '');
+        setDefaultDatabase(initialConnection.default_database || '');
+        setSsl(Boolean(initialConnection.ssl));
+        setSshEnabled(Boolean(initialConnection.ssh_enabled));
+        setSshHost(initialConnection.ssh_host || 'localhost');
+        setSshPort(initialConnection.ssh_port || 22);
+        setSshUser(initialConnection.ssh_user || '');
+        setSshAuthMethod(initialConnection.ssh_auth_method || 'password');
+        setSshPassword(initialConnection.ssh_password || '');
+        setSshKeyFile(initialConnection.ssh_key_file || '');
+        setSshKeyPassphrase(initialConnection.ssh_key_passphrase || '');
+      }
       setIsReadOnly(Boolean(initialConnection.is_readonly));
       setEnvironment(initialConnection.environment || 'development');
       setConnectionName(initialConnection.name);
       setSelectedColor(initialConnection.color || (initialConnection.environment === 'production' ? '#ef4444' : '#06b6d4'));
     } else {
       // Clean reset for New Connection
+      setConnCategory(initialMode);
       setDriver('postgresql');
       setHost('localhost');
       setPort(5432);
@@ -149,68 +190,145 @@ export function ConnectionView({
       setConnectionName('');
       setSelectedColor('#06b6d4');
     }
-  }, [initialConnection]);
+  }, [initialConnection, initialMode]);
 
-  const assembleConnection = (): DatabaseConnection => ({
-    id: initialConnection?.id || `conn-${Date.now()}`,
-    name: connectionName || 'Untitled Connection',
-    driver,
-    host,
-    port,
-    username,
-    password: savePassword ? password : '',
-    default_database: defaultDatabase,
-    ssl: ssl ? 1 : 0,
-    ssh_enabled: sshEnabled ? 1 : 0,
-    ssh_host: sshHost,
-    ssh_port: sshPort,
-    ssh_user: sshUser,
-    ssh_auth_method: sshAuthMethod,
-    ssh_password: savePassword ? sshPassword : '',
-    ssh_key_file: sshKeyFile,
-    ssh_key_passphrase: savePassword ? sshKeyPassphrase : '',
-    color: selectedColor,
-    is_readonly: isReadOnly ? 1 : 0,
-    environment,
-    created_at: initialConnection?.created_at || new Date().toISOString()
-  });
+  const assembleConnection = (): DatabaseConnection => {
+    if (connCategory === 'ssh') {
+      return {
+        id: initialConnection?.id || `conn-${Date.now()}`,
+        name: connectionName || `${sshUser || 'root'}@${sshHost || 'localhost'}`,
+        driver: 'ssh',
+        connection_mode: 'ssh',
+        host: sshHost || 'localhost',
+        port: sshPort || 22,
+        username: sshUser || 'root',
+        password: savePassword ? sshPassword : '',
+        default_database: '',
+        ssl: 0,
+        ssh_enabled: 1,
+        ssh_host: sshHost || 'localhost',
+        ssh_port: sshPort || 22,
+        ssh_user: sshUser || 'root',
+        ssh_auth_method: sshAuthMethod,
+        ssh_password: savePassword ? sshPassword : '',
+        ssh_key_file: sshKeyFile,
+        ssh_key_passphrase: savePassword ? sshKeyPassphrase : '',
+        color: selectedColor,
+        is_readonly: 0,
+        environment,
+        created_at: initialConnection?.created_at || new Date().toISOString()
+      };
+    }
 
-  const handleTestConnection = async () => {
+    return {
+      id: initialConnection?.id || `conn-${Date.now()}`,
+      name: connectionName || 'Untitled Connection',
+      driver,
+      connection_mode: 'database',
+      host,
+      port,
+      username,
+      password: savePassword ? password : '',
+      default_database: defaultDatabase,
+      ssl: ssl ? 1 : 0,
+      ssh_enabled: sshEnabled ? 1 : 0,
+      ssh_host: sshHost,
+      ssh_port: sshPort,
+      ssh_user: sshUser,
+      ssh_auth_method: sshAuthMethod,
+      ssh_password: savePassword ? sshPassword : '',
+      ssh_key_file: sshKeyFile,
+      ssh_key_passphrase: savePassword ? sshKeyPassphrase : '',
+      color: selectedColor,
+      is_readonly: isReadOnly ? 1 : 0,
+      environment,
+      created_at: initialConnection?.created_at || new Date().toISOString()
+    };
+  };
+
+  const handleTestConnection = async (testMode?: 'ssh_handshake_only' | React.MouseEvent | unknown) => {
     setIsTesting(true);
     try {
+      const isSsh = connCategory === 'ssh' || testMode === 'ssh_handshake_only';
+      const body = isSsh
+        ? {
+            driver: 'ssh',
+            connection_mode: 'ssh',
+            is_ssh_only: true,
+            host: sshHost,
+            port: sshPort,
+            username: sshUser,
+            ssh_auth_method: sshAuthMethod,
+            password: sshPassword,
+            ssh_key_file: sshKeyFile,
+            ssh_key_passphrase: sshKeyPassphrase,
+            environment
+          }
+        : {
+            driver,
+            connection_mode: 'database',
+            host,
+            port,
+            username: authMethod === 'password' ? username : '',
+            password: authMethod === 'password' ? password : '',
+            default_database: defaultDatabase,
+            ssl: ssl ? 1 : 0,
+            ssh_enabled: sshEnabled ? 1 : 0,
+            ssh_host: sshHost,
+            ssh_port: sshPort,
+            ssh_user: sshUser,
+            ssh_auth_method: sshAuthMethod,
+            ssh_password: sshPassword,
+            ssh_key_file: sshKeyFile,
+            ssh_key_passphrase: sshKeyPassphrase,
+            environment
+          };
+
       const res = await fetch('/api/connections/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          driver,
-          host,
-          port,
-          username: authMethod === 'password' ? username : '',
-          password: authMethod === 'password' ? password : '',
-          default_database: defaultDatabase,
-          ssl: ssl ? 1 : 0,
-          ssh_enabled: sshEnabled ? 1 : 0,
-          ssh_host: sshHost,
-          ssh_port: sshPort,
-          ssh_user: sshUser,
-          ssh_auth_method: sshAuthMethod,
-          ssh_password: sshPassword,
-          ssh_key_file: sshKeyFile,
-          ssh_key_passphrase: sshKeyPassphrase,
-          environment
-        })
+        body: JSON.stringify(body)
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        success('Connection Successful', `${data.message} (${data.latency_ms}ms latency)`);
+        success(
+          isSsh ? 'SSH Handshake Succeeded' : 'Connection Successful',
+          `${data.message} (${data.latency_ms}ms latency)`
+        );
       } else {
-        error('Connection Failed', data.message || 'Could not establish connection to database server.');
+        error('Connection Failed', data.message || (isSsh ? 'Failed to connect to SSH server.' : 'Could not establish connection.'));
       }
     } catch {
       error('Network Error', 'Failed to reach local test proxy server.');
     } finally {
       setIsTesting(false);
     }
+  };
+
+  const handleLaunchSshCli = () => {
+    if (!onOpenSsh) return;
+    onOpenSsh({
+      host: sshHost || 'localhost',
+      port: Number(sshPort) || 22,
+      username: sshUser || 'root',
+      authMethod: sshAuthMethod,
+      password: sshPassword,
+      keyFile: sshKeyFile,
+      passphrase: sshKeyPassphrase
+    });
+  };
+
+  const handleLaunchSftpExplorer = () => {
+    if (!onOpenSftp) return;
+    onOpenSftp({
+      host: sshHost || 'localhost',
+      port: Number(sshPort) || 22,
+      username: sshUser || 'root',
+      authMethod: sshAuthMethod,
+      password: sshPassword,
+      keyFile: sshKeyFile,
+      passphrase: sshKeyPassphrase
+    });
   };
 
   const handleConnect = () => {
@@ -265,91 +383,99 @@ export function ConnectionView({
         {/* Header & Import from URL (Exact Image #1 match) */}
         <div className="flex items-center justify-between pb-2 border-b border-zinc-800/80">
           <h2 className="text-base font-semibold text-zinc-100 tracking-tight">
-            {initialConnection ? `Edit Connection: ${initialConnection.name}` : 'New Connection'}
+            {initialConnection
+              ? `Edit ${connCategory === 'ssh' ? 'SSH Server' : 'Connection'}: ${initialConnection.name}`
+              : (connCategory === 'ssh' ? 'New Remote SSH / SFTP Server' : 'New Connection')}
           </h2>
-          <button
-            onClick={() => setShowUrlModal(true)}
-            className="flex items-center gap-1.5 text-xs text-zinc-300 hover:text-yellow-400 font-medium transition-colors cursor-pointer"
-          >
-            <LinkIcon className="w-3.5 h-3.5" />
-            <span>Import from URL</span>
-          </button>
+          {connCategory === 'database' && (
+            <button
+              onClick={() => setShowUrlModal(true)}
+              className="flex items-center gap-1.5 text-xs text-zinc-300 hover:text-yellow-400 font-medium transition-colors cursor-pointer"
+            >
+              <LinkIcon className="w-3.5 h-3.5" />
+              <span>Import from URL</span>
+            </button>
+          )}
         </div>
 
         {/* Connection Form Fields */}
         <div className="space-y-4">
-          {/* Environment Type (Development, Test, Production) */}
-          <div className="space-y-2 p-3 rounded-lg bg-zinc-900/60 border border-zinc-800">
-            <div className="flex items-center justify-between">
-              <label className="text-xs font-semibold text-zinc-300 mb-1">Environment Type</label>
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setEnvironment('development');
-                  setSelectedColor('#10b981');
-                }}
-                className={cn(
-                  "flex flex-col items-center justify-center p-2 rounded-md border text-xs cursor-pointer transition-all",
-                  environment === 'development'
-                    ? "bg-emerald-950/50 border-emerald-500 text-emerald-200 ring-1 ring-emerald-500/50"
-                    : "bg-zinc-900/40 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60"
-                )}
-              >
-                <span className="font-semibold text-xs">Development</span>
-                <span className="text-[10px] text-zinc-500 mt-0.5">Local / Dev</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setEnvironment('test');
-                  setSelectedColor('#f59e0b');
-                }}
-                className={cn(
-                  "flex flex-col items-center justify-center p-2 rounded-md border text-xs cursor-pointer transition-all",
-                  environment === 'test'
-                    ? "bg-amber-950/50 border-amber-500 text-amber-200 ring-1 ring-amber-500/50"
-                    : "bg-zinc-900/40 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60"
-                )}
-              >
-                <span className="font-semibold text-xs">Test / Staging</span>
-                <span className="text-[10px] text-zinc-500 mt-0.5">QA & Testing</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setEnvironment('production');
-                  setSelectedColor('#ef4444');
-                }}
-                className={cn(
-                  "flex flex-col items-center justify-center p-2 rounded-md border text-xs cursor-pointer transition-all",
-                  environment === 'production'
-                    ? "bg-red-950/60 border-red-500 text-red-200 ring-1 ring-red-500/50"
-                    : "bg-zinc-900/40 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60"
-                )}
-              >
-                <div className="flex items-center gap-1 font-semibold text-xs text-red-300">
-                  <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
-                  <span>Production</span>
-                </div>
-                <span className="text-[10px] text-red-400/80 mt-0.5">Manual Commit</span>
-              </button>
-            </div>
-            {environment === 'production' && (
-              <div className="p-2 rounded bg-red-950/30 border border-red-500/30 flex items-start gap-2 text-xs text-red-300 animate-in fade-in-50 mt-1">
-                <ShieldAlert className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                <div className="text-[11px] leading-tight">
-                  <strong className="text-red-200 font-semibold">Production Safety Mode Active:</strong>
-                  <p className="text-red-300/80 mt-0.5">
-                    Autocommit will be disabled automatically. All queries and changes require manual Commit and can be Rolled back to prevent accidental data loss.
-                  </p>
-                </div>
+          {/* Environment Type (Development, Test, Production) - Only for Database Connections */}
+          {connCategory === 'database' && (
+            <div className="space-y-2 p-3 rounded-lg bg-zinc-900/60 border border-zinc-800">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-semibold text-zinc-300 mb-1">Environment Type</label>
               </div>
-            )}
-          </div>
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEnvironment('development');
+                    setSelectedColor('#10b981');
+                  }}
+                  className={cn(
+                    "flex flex-col items-center justify-center p-2 rounded-md border text-xs cursor-pointer transition-all",
+                    environment === 'development'
+                      ? "bg-emerald-950/50 border-emerald-500 text-emerald-200 ring-1 ring-emerald-500/50"
+                      : "bg-zinc-900/40 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60"
+                  )}
+                >
+                  <span className="font-semibold text-xs">Development</span>
+                  <span className="text-[10px] text-zinc-500 mt-0.5">Local / Dev</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEnvironment('test');
+                    setSelectedColor('#f59e0b');
+                  }}
+                  className={cn(
+                    "flex flex-col items-center justify-center p-2 rounded-md border text-xs cursor-pointer transition-all",
+                    environment === 'test'
+                      ? "bg-amber-950/50 border-amber-500 text-amber-200 ring-1 ring-amber-500/50"
+                      : "bg-zinc-900/40 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60"
+                  )}
+                >
+                  <span className="font-semibold text-xs">Test / Staging</span>
+                  <span className="text-[10px] text-zinc-500 mt-0.5">QA & Testing</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEnvironment('production');
+                    setSelectedColor('#ef4444');
+                  }}
+                  className={cn(
+                    "flex flex-col items-center justify-center p-2 rounded-md border text-xs cursor-pointer transition-all",
+                    environment === 'production'
+                      ? "bg-red-950/60 border-red-500 text-red-200 ring-1 ring-red-500/50"
+                      : "bg-zinc-900/40 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60"
+                  )}
+                >
+                  <div className="flex items-center gap-1 font-semibold text-xs text-red-300">
+                    <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
+                    <span>Production</span>
+                  </div>
+                  <span className="text-[10px] text-red-400/80 mt-0.5">Manual Commit</span>
+                </button>
+              </div>
+              {environment === 'production' && (
+                <div className="p-2 rounded bg-red-950/30 border border-red-500/30 flex items-start gap-2 text-xs text-red-300 animate-in fade-in-50 mt-1">
+                  <ShieldAlert className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                  <div className="text-[11px] leading-tight">
+                    <strong className="text-red-200 font-semibold">Production Safety Mode Active:</strong>
+                    <p className="text-red-300/80 mt-0.5">
+                      Autocommit will be disabled automatically. All queries and changes require manual Commit and can be Rolled back to prevent accidental data loss.
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
-          {/* Database Type */}
+          {connCategory === 'database' ? (
+            <>
+              {/* Database Type */}
           <div className="space-y-1.5">
             <label className="text-xs font-medium text-zinc-400">Database Driver</label>
             <Select
@@ -578,6 +704,19 @@ export function ConnectionView({
                     </div>
                   </div>
                 )}
+
+                <div className="flex justify-end pt-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => handleTestConnection('ssh_handshake_only')}
+                    disabled={isTesting}
+                    className="text-[11px] text-zinc-400 hover:text-zinc-200 cursor-pointer"
+                  >
+                    {isTesting ? 'Testing SSH...' : 'Test SSH Tunnel Handshake'}
+                  </Button>
+                </div>
               </div>
             )}
           </div>
@@ -613,7 +752,152 @@ export function ConnectionView({
               Connect
             </Button>
           </div>
+        </>
+      ) : (
+        <div className="space-y-4">
+          <div className="grid grid-cols-4 gap-3">
+            <div className="col-span-3 space-y-1.5">
+              <label className="text-xs font-medium text-zinc-300">SSH Server Host / IP</label>
+              <div className="relative">
+                <Server className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-zinc-500" />
+                <Input
+                  value={sshHost}
+                  onChange={e => setSshHost(e.target.value)}
+                  placeholder="192.168.1.100 or vps.example.com"
+                  className="pl-8 text-xs font-mono"
+                />
+              </div>
+            </div>
+            <div className="col-span-1 space-y-1.5">
+              <label className="text-xs font-medium text-zinc-300">Port</label>
+              <Input
+                type="number"
+                value={sshPort}
+                onChange={e => setSshPort(parseInt(e.target.value, 10) || 22)}
+                placeholder="22"
+                className="text-xs font-mono"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-zinc-300">SSH Username</label>
+              <Input
+                value={sshUser}
+                onChange={e => setSshUser(e.target.value)}
+                placeholder="root or ubuntu"
+                className="text-xs font-mono"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-zinc-300">Authentication Method</label>
+              <Select
+                value={sshAuthMethod}
+                onChange={e => setSshAuthMethod(e.target.value as 'password' | 'key')}
+              >
+                <option value="password">Password</option>
+                <option value="key">Private Key (.pem / .id_rsa)</option>
+              </Select>
+            </div>
+          </div>
+
+          {sshAuthMethod === 'password' ? (
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-zinc-300">SSH Password</label>
+              <div className="relative">
+                <Input
+                  type={showSshPassword ? 'text' : 'password'}
+                  value={sshPassword}
+                  onChange={e => setSshPassword(e.target.value)}
+                  placeholder="••••••••••••"
+                  className="text-xs font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowSshPassword(!showSshPassword)}
+                  className="absolute right-2.5 top-2 text-zinc-500 hover:text-zinc-200 cursor-pointer"
+                  title={showSshPassword ? 'Hide password' : 'Show password'}
+                >
+                  {showSshPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-zinc-300">Private Key File Path</label>
+                <div className="relative">
+                  <Key className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-zinc-500" />
+                  <Input
+                    value={sshKeyFile}
+                    onChange={e => setSshKeyFile(e.target.value)}
+                    placeholder="~/.ssh/id_rsa or /home/user/.ssh/deploy.pem"
+                    className="pl-8 text-xs font-mono"
+                  />
+                </div>
+                <p className="text-[10px] text-zinc-500">Supports OpenSSH RSA, Ed25519, and PEM key files.</p>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-zinc-300">Key Passphrase (optional)</label>
+                <div className="relative">
+                  <Input
+                    type={showSshKeyPassphrase ? 'text' : 'password'}
+                    value={sshKeyPassphrase}
+                    onChange={e => setSshKeyPassphrase(e.target.value)}
+                    placeholder="••••••••"
+                    className="text-xs font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowSshKeyPassphrase(!showSshKeyPassphrase)}
+                    className="absolute right-2.5 top-2 text-zinc-500 hover:text-zinc-200 cursor-pointer"
+                  >
+                    {showSshKeyPassphrase ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Quick Launch Buttons for SSH Mode */}
+          <div className="flex items-center justify-between gap-3 pt-3 border-t border-zinc-800">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleTestConnection}
+              disabled={isTesting}
+              className="px-4 text-xs text-zinc-200"
+            >
+              {isTesting ? 'Testing SSH...' : 'Test Connection'}
+            </Button>
+
+            <div className="flex items-center gap-2">
+              {onOpenSsh && (
+                <Button
+                  type="button"
+                  onClick={handleLaunchSshCli}
+                  className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer shadow-sm"
+                >
+                  <Terminal className="w-3.5 h-3.5" />
+                  <span>Open SSH CLI</span>
+                </Button>
+              )}
+              {onOpenSftp && (
+                <Button
+                  type="button"
+                  onClick={handleLaunchSftpExplorer}
+                  className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium bg-sky-600 hover:bg-sky-500 text-white cursor-pointer shadow-sm"
+                >
+                  <FolderArchive className="w-3.5 h-3.5" />
+                  <span>Open SFTP Explorer</span>
+                </Button>
+              )}
+            </div>
+          </div>
         </div>
+      )}
+    </div>
 
         {/* Section: Save Connection (Image #1 bottom panel) */}
         <div className="pt-4 border-t border-zinc-800/80 space-y-3">
@@ -623,7 +907,7 @@ export function ConnectionView({
             <Input
               value={connectionName}
               onChange={e => setConnectionName(e.target.value)}
-              placeholder="Connection Name (e.g. Local or PROD - RSKG)"
+              placeholder="Connection Name (e.g. Production Web, Analytics DB)"
             />
           </div>
 

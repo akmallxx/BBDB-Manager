@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Plus, Search, ChevronRight, ChevronDown, Table as TableIcon, RefreshCw, Trash2, Database, Layers, Terminal, MoreVertical, Edit3, Copy, Plug, Key, Unplug, FileCode, Download, ExternalLink } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Plus, Search, ChevronRight, ChevronDown, Table as TableIcon, RefreshCw, Trash2, Database, Layers, Terminal, MoreVertical, Edit3, Copy, Plug, Key, Unplug, FileCode, Download, ExternalLink, FolderArchive } from 'lucide-react';
 import { DatabaseConnection, SchemaGroup, QueryHistoryItem, TableColumn } from '../types/database';
 import { Badge } from './ui/badge';
 import { Select } from './ui/select';
@@ -12,16 +12,19 @@ import { APP_NAME } from '../lib/config';
 
 interface SidebarDrawerProps {
   currentView: RailView;
+  onViewChange?: (view: RailView) => void;
   // Connections
   connections: DatabaseConnection[];
   activeConnectionId?: string;
   selectedConnectionId?: string;
   onSelectConnection: (id: string) => void;
   onConnectConnection: (conn: DatabaseConnection) => void;
-  onNewConnectionClick: () => void;
+  onNewConnectionClick: (mode?: 'database' | 'ssh') => void;
   onDeleteConnection: (id: string) => void;
   onDuplicateConnection?: (conn: DatabaseConnection) => void;
   onDisconnect?: () => void;
+  onOpenSsh?: (connId?: string) => void;
+  onOpenSftp?: (connId?: string) => void;
   // Entities
   activeDatabase: string;
   databasesList: string[];
@@ -39,10 +42,17 @@ interface SidebarDrawerProps {
   onSelectHistoryItem: (query: string) => void;
   // Sizing
   width?: number;
+  // Workspace mode
+  workspaceMode?: 'database' | 'ssh';
+  onWorkspaceModeChange?: (mode: 'database' | 'ssh') => void;
+  activeTabType?: string;
+  activeSshConnection?: DatabaseConnection | null;
+  onDisconnectSsh?: () => void;
 }
 
 export function SidebarDrawer({
   currentView,
+  onViewChange,
   connections,
   activeConnectionId,
   selectedConnectionId,
@@ -52,6 +62,8 @@ export function SidebarDrawer({
   onDeleteConnection,
   onDuplicateConnection,
   onDisconnect,
+  onOpenSsh,
+  onOpenSftp,
   activeDatabase,
   databasesList,
   onChangeDatabase,
@@ -65,10 +77,37 @@ export function SidebarDrawer({
   onRefreshHistory,
   onClearHistory,
   onSelectHistoryItem,
-  width
+  width,
+  workspaceMode,
+  onWorkspaceModeChange,
+  activeTabType,
+  activeSshConnection,
+  onDisconnectSsh
 }: SidebarDrawerProps) {
   const { success, error, info } = useToast();
 
+  const [connModeTab, setConnModeTab] = useState<'database' | 'ssh'>(workspaceMode || 'database');
+
+  const activeDbConnection = connections.find(
+    c => c.id === activeConnectionId && c.connection_mode !== 'ssh' && c.driver !== 'ssh'
+  );
+
+  useEffect(() => {
+    if (workspaceMode) {
+      setConnModeTab(workspaceMode);
+    }
+  }, [workspaceMode]);
+
+  // Auto-collapse SSH connection list when connected
+  const [isSshListCollapsed, setIsSshListCollapsed] = useState(false);
+
+  useEffect(() => {
+    if (activeSshConnection) {
+      setIsSshListCollapsed(true);
+    } else {
+      setIsSshListCollapsed(false);
+    }
+  }, [activeSshConnection?.id]);
   const [filterText, setFilterText] = useState('');
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [tableMenu, setTableMenu] = useState<{
@@ -270,19 +309,55 @@ export function SidebarDrawer({
               <span className="text-xs font-semibold font-mono tracking-wider text-zinc-200">{APP_NAME}</span>
             </div>
 
+            {/* Mode Toggle: Database vs SSH / SFTP */}
+            <div className="grid grid-cols-2 gap-1 p-0.5 rounded-lg bg-zinc-950/90 border border-zinc-800">
+              <button
+                type="button"
+                onClick={() => {
+                  setConnModeTab('database');
+                  onWorkspaceModeChange?.('database');
+                }}
+                className={cn(
+                  "flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-md text-[11px] font-medium transition-all cursor-pointer",
+                  connModeTab === 'database'
+                    ? "bg-zinc-800 text-yellow-400 font-semibold shadow-xs border border-zinc-700/60"
+                    : "text-zinc-400 hover:text-zinc-200"
+                )}
+              >
+                <Database className="w-3 h-3 text-yellow-400" />
+                <span>DB</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConnModeTab('ssh');
+                  onWorkspaceModeChange?.('ssh');
+                }}
+                className={cn(
+                  "flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-md text-[11px] font-medium transition-all cursor-pointer",
+                  connModeTab === 'ssh'
+                    ? "bg-zinc-800 text-emerald-400 font-semibold shadow-xs border border-zinc-700/60"
+                    : "text-zinc-400 hover:text-zinc-200"
+                )}
+              >
+                <Terminal className="w-3 h-3 text-emerald-400" />
+                <span>SSH/SFTP</span>
+              </button>
+            </div>
+
             <button
-              onClick={onNewConnectionClick}
+              onClick={() => onNewConnectionClick(connModeTab)}
               className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700/80 text-zinc-100 text-xs font-medium border border-zinc-700/50 transition-colors shadow-sm cursor-pointer"
             >
               <Plus className="w-4 h-4 text-zinc-300" />
-              <span>New Connection</span>
+              <span>{connModeTab === 'database' ? 'New DB Connection' : 'New SSH / SFTP Server'}</span>
             </button>
 
             <div className="relative">
               <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-zinc-500 pointer-events-none" />
               <input
                 type="text"
-                placeholder="Filter"
+                placeholder={connModeTab === 'database' ? "Filter database connections..." : "Filter SSH / SFTP servers..."}
                 value={filterText}
                 onChange={e => setFilterText(e.target.value)}
                 className="w-full bg-zinc-950/80 border border-zinc-800 rounded-md py-1.5 pl-8 pr-2 text-xs text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:border-yellow-400"
@@ -290,24 +365,178 @@ export function SidebarDrawer({
             </div>
           </div>
 
+          {/* Active Database Connection Card */}
+          {connModeTab === 'database' && activeDbConnection && (
+            <div className="mx-3 mt-2.5 p-2.5 rounded-lg bg-yellow-950/30 border border-yellow-800/40 space-y-2 shrink-0 shadow-xs">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse shrink-0" />
+                  <span className="text-xs font-semibold text-yellow-200 truncate">{activeDbConnection.name}</span>
+                  {activeDbConnection.environment && (
+                    <span className={cn(
+                      "px-1.5 py-0.2 rounded text-[9px] font-bold uppercase tracking-wider shrink-0 border",
+                      activeDbConnection.environment === 'production'
+                        ? "bg-red-500/20 text-red-300 border-red-500/30"
+                        : activeDbConnection.environment === 'test'
+                        ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
+                        : "bg-zinc-800 text-zinc-400 border-zinc-700/50"
+                    )}>
+                      {activeDbConnection.environment.slice(0, 4)}
+                    </span>
+                  )}
+                </div>
+                {onDisconnect && (
+                  <button
+                    type="button"
+                    onClick={onDisconnect}
+                    title="Disconnect Database Session"
+                    className="p-1 rounded text-zinc-400 hover:text-red-400 hover:bg-zinc-800/80 transition-colors cursor-pointer"
+                  >
+                    <Unplug className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+              <div className="text-[10px] font-mono text-zinc-400 truncate">
+                <span className="uppercase text-yellow-400/90 font-semibold">{activeDbConnection.driver}</span>
+                {' • '}
+                <span>{activeDbConnection.host || 'localhost'}:{activeDbConnection.port || 5432}/{activeDatabase || activeDbConnection.default_database || 'default'}</span>
+              </div>
+
+              {/* Quick Navigation: Entities vs New Query */}
+              <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                <button
+                  type="button"
+                  onClick={() => onViewChange?.('entities')}
+                  className="flex items-center justify-center gap-1.5 py-1 px-2 rounded text-[11px] font-medium transition-all cursor-pointer border bg-zinc-900/90 text-zinc-400 border-zinc-800 hover:text-yellow-300 hover:bg-zinc-800/80 shadow-xs"
+                >
+                  <Layers className="w-3 h-3 text-yellow-400" />
+                  <span>Entities</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenQueryTab?.('')}
+                  className="flex items-center justify-center gap-1.5 py-1 px-2 rounded text-[11px] font-medium transition-all cursor-pointer border bg-zinc-900/90 text-zinc-400 border-zinc-800 hover:text-yellow-300 hover:bg-zinc-800/80 shadow-xs"
+                >
+                  <FileCode className="w-3 h-3 text-yellow-400" />
+                  <span>New Query</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Active Remote SSH Session Card */}
+          {connModeTab === 'ssh' && activeSshConnection && (
+            <div className="mx-3 mt-2.5 p-2.5 rounded-lg bg-emerald-950/40 border border-emerald-800/50 space-y-2 shrink-0 shadow-xs">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                  <span className="text-xs font-semibold text-emerald-200 truncate">{activeSshConnection.name}</span>
+                </div>
+                {onDisconnectSsh && (
+                  <button
+                    type="button"
+                    onClick={onDisconnectSsh}
+                    title="Disconnect SSH Session"
+                    className="p-1 rounded text-zinc-400 hover:text-red-400 hover:bg-zinc-800/80 transition-colors cursor-pointer"
+                  >
+                    <Unplug className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+              <div className="text-[10px] font-mono text-zinc-400 truncate">
+                {activeSshConnection.ssh_user || activeSshConnection.username || 'root'}@{activeSshConnection.ssh_host || activeSshConnection.host || 'localhost'}:{activeSshConnection.ssh_port || activeSshConnection.port || 22}
+              </div>
+
+              {/* Quick Navigation: CLI vs SFTP */}
+              <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                <button
+                  type="button"
+                  onClick={() => onOpenSsh?.(activeSshConnection.id)}
+                  className={cn(
+                    "flex items-center justify-center gap-1.5 py-1 px-2 rounded text-[11px] font-medium transition-all cursor-pointer border",
+                    activeTabType === 'ssh_terminal'
+                      ? "bg-emerald-800 text-emerald-100 border-emerald-600 font-semibold shadow-xs"
+                      : "bg-zinc-900/90 text-zinc-400 border-zinc-800 hover:text-zinc-200 hover:bg-zinc-800/60"
+                  )}
+                >
+                  <Terminal className="w-3 h-3" />
+                  <span>Terminal</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenSftp?.(activeSshConnection.id)}
+                  className={cn(
+                    "flex items-center justify-center gap-1.5 py-1 px-2 rounded text-[11px] font-medium transition-all cursor-pointer border",
+                    activeTabType === 'sftp_explorer'
+                      ? "bg-sky-800 text-sky-100 border-sky-600 font-semibold shadow-xs"
+                      : "bg-zinc-900/90 text-zinc-400 border-zinc-800 hover:text-zinc-200 hover:bg-zinc-800/60"
+                  )}
+                >
+                  <FolderArchive className="w-3 h-3" />
+                  <span>SFTP Files</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Section: SAVED */}
-          <div className="flex items-center justify-between px-3 pt-3 pb-1">
+          <div
+            onClick={() => {
+              if (connModeTab === 'ssh') {
+                setIsSshListCollapsed(prev => !prev);
+              }
+            }}
+            className={cn(
+              "flex items-center justify-between px-3 pt-3 pb-1 select-none",
+              connModeTab === 'ssh' && "cursor-pointer hover:bg-zinc-800/40 rounded transition-colors"
+            )}
+            title={connModeTab === 'ssh' ? (isSshListCollapsed ? "Click to expand SSH servers list" : "Click to collapse SSH servers list") : undefined}
+          >
             <div className="flex items-center gap-1.5">
-              <span className="text-[11px] font-bold tracking-wider text-zinc-400 uppercase">Saved</span>
+              {connModeTab === 'ssh' && (
+                isSshListCollapsed
+                  ? <ChevronRight className="w-3 h-3 text-zinc-500" />
+                  : <ChevronDown className="w-3 h-3 text-zinc-500" />
+              )}
+              <span className="text-[11px] font-bold tracking-wider text-zinc-400 uppercase">
+                {connModeTab === 'database' ? 'Saved Databases' : 'Saved SSH Servers'}
+              </span>
               <span className="px-1.5 py-0.2 text-[10px] rounded-full bg-zinc-800 text-zinc-400 font-mono">
-                {connections.length}
+                {connections.filter(c => connModeTab === 'ssh' ? (c.connection_mode === 'ssh' || c.driver === 'ssh') : (c.connection_mode !== 'ssh' && c.driver !== 'ssh')).length}
               </span>
             </div>
+            {connModeTab === 'ssh' && (
+              <span className="text-[10px] text-zinc-500 hover:text-zinc-300 font-medium">
+                {isSshListCollapsed ? 'Show' : 'Hide'}
+              </span>
+            )}
           </div>
 
           {/* List of Saved Connections */}
-          <div className="flex-1 overflow-y-auto px-2 py-1 space-y-1">
+          {(!isSshListCollapsed || connModeTab !== 'ssh') ? (
+            <div className="flex-1 overflow-y-auto px-2 py-1 space-y-1">
             {connections
-              .filter(c => c.name.toLowerCase().includes(filterText.toLowerCase()) || c.driver.toLowerCase().includes(filterText.toLowerCase()))
+              .filter(c => {
+                const isSsh = c.connection_mode === 'ssh' || c.driver === 'ssh';
+                if (connModeTab === 'database' && isSsh) return false;
+                if (connModeTab === 'ssh' && !isSsh) return false;
+                const query = filterText.toLowerCase();
+                return (
+                  c.name.toLowerCase().includes(query) ||
+                  c.driver.toLowerCase().includes(query) ||
+                  (c.host && c.host.toLowerCase().includes(query)) ||
+                  (c.ssh_host && c.ssh_host.toLowerCase().includes(query)) ||
+                  (c.username && c.username.toLowerCase().includes(query)) ||
+                  (c.ssh_user && c.ssh_user.toLowerCase().includes(query))
+                );
+              })
               .map(conn => {
                 const isSelected = conn.id === selectedConnectionId;
                 const isActive = conn.id === activeConnectionId;
-                const subtitle = conn.ssh_enabled
+                const isSsh = conn.connection_mode === 'ssh' || conn.driver === 'ssh';
+                const subtitle = isSsh
+                  ? `${conn.ssh_user || conn.username || 'root'}@${conn.ssh_host || conn.host || 'localhost'}:${conn.ssh_port || conn.port || 22}`
+                  : conn.ssh_enabled
                   ? `${conn.host || 'localhost'} > ${conn.ssh_host}:${conn.port}/${conn.default_database}`
                   : `${conn.host || 'localhost'}:${conn.port}/${conn.default_database}`;
 
@@ -315,7 +544,13 @@ export function SidebarDrawer({
                   <div
                     key={conn.id}
                     onClick={() => onSelectConnection(conn.id)}
-                    onDoubleClick={() => onConnectConnection(conn)}
+                    onDoubleClick={() => {
+                      if (isSsh) {
+                        onOpenSsh?.(conn.id);
+                      } else {
+                        onConnectConnection(conn);
+                      }
+                    }}
                     className={cn(
                       'group relative flex items-center justify-between p-1 rounded-md transition-all cursor-pointer border',
                       isSelected
@@ -333,17 +568,17 @@ export function SidebarDrawer({
                     <div className="ml-2.5 flex-1 min-w-0 pr-2">
                       <div className="flex items-center gap-1.5">
                         <span className="text-xs font-medium text-zinc-300 truncate">{conn.name}</span>
-                        {conn.environment === 'production' && (
+                        {!isSsh && conn.environment === 'production' && (
                           <span className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold bg-red-500/20 text-red-400 border border-red-500/30 shrink-0">
                             PROD
                           </span>
                         )}
-                        {conn.environment === 'test' && (
+                        {!isSsh && conn.environment === 'test' && (
                           <span className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30 shrink-0">
                             TEST
                           </span>
                         )}
-                        {(!conn.environment || conn.environment === 'development') && (
+                        {!isSsh && (!conn.environment || conn.environment === 'development') && (
                           <span className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 shrink-0">
                             DEV
                           </span>
@@ -354,8 +589,39 @@ export function SidebarDrawer({
                       </div>
                     </div>
 
-                    {/* Driver Badge & 3-Dots Action Menu */}
+                    {/* Driver Badge & Action Buttons / 3-Dots */}
                     <div className="flex items-center gap-1 shrink-0 relative">
+                      {isSsh && (
+                        <div className="flex items-center gap-0.5 mr-0.5">
+                          {onOpenSsh && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenSsh(conn.id);
+                              }}
+                              title="Open SSH CLI Terminal"
+                              className="p-1 rounded text-zinc-400 hover:text-emerald-400 hover:bg-emerald-950/40 transition-colors cursor-pointer"
+                            >
+                              <Terminal className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {onOpenSftp && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenSftp(conn.id);
+                              }}
+                              title="Open SFTP Explorer"
+                              className="p-1 rounded text-zinc-400 hover:text-sky-400 hover:bg-sky-950/40 transition-colors cursor-pointer"
+                            >
+                              <FolderArchive className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      )}
+
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -421,6 +687,32 @@ export function SidebarDrawer({
                               <span>Edit Connection</span>
                             </button>
 
+                            {onOpenSsh && (
+                              <button
+                                onClick={() => {
+                                  setOpenMenuId(null);
+                                  onOpenSsh(conn.id);
+                                }}
+                                className="w-full flex items-center gap-2 px-3 py-1.5 text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer text-left"
+                              >
+                                <Terminal className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                                <span>Open SSH CLI</span>
+                              </button>
+                            )}
+
+                            {onOpenSftp && (
+                              <button
+                                onClick={() => {
+                                  setOpenMenuId(null);
+                                  onOpenSftp(conn.id);
+                                }}
+                                className="w-full flex items-center gap-2 px-3 py-1.5 text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer text-left"
+                              >
+                                <FolderArchive className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                                <span>Open SFTP Explorer</span>
+                              </button>
+                            )}
+
                             {onDuplicateConnection && (
                               <button
                                 onClick={() => {
@@ -456,12 +748,31 @@ export function SidebarDrawer({
                 );
               })}
 
-            {connections.length === 0 && (
-              <div className="p-4 text-center text-xs text-zinc-500">
-                No saved connections yet. Click New Connection to start.
+            {connections.filter(c => connModeTab === 'ssh' ? (c.connection_mode === 'ssh' || c.driver === 'ssh') : (c.connection_mode !== 'ssh' && c.driver !== 'ssh')).length === 0 && (
+              <div className="p-6 text-center text-xs text-zinc-500 space-y-2">
+                <p>No saved {connModeTab === 'ssh' ? 'SSH servers' : 'database connections'} found.</p>
+                <button
+                  type="button"
+                  onClick={() => onNewConnectionClick(connModeTab)}
+                  className="text-xs text-yellow-400 hover:text-yellow-300 underline cursor-pointer"
+                >
+                  + Add new {connModeTab === 'ssh' ? 'SSH server' : 'database connection'}
+                </button>
               </div>
             )}
           </div>
+          ) : (
+            <div className="px-3 py-3 text-center">
+              <button
+                type="button"
+                onClick={() => setIsSshListCollapsed(false)}
+                className="text-[11px] text-zinc-400 hover:text-emerald-400 transition-colors cursor-pointer flex items-center justify-center gap-1.5 mx-auto py-1.5 px-3 rounded-md hover:bg-zinc-800/40 border border-zinc-800/60"
+              >
+                <span>Show {connections.filter(c => c.connection_mode === 'ssh' || c.driver === 'ssh').length} saved servers</span>
+                <ChevronDown className="w-3 h-3" />
+              </button>
+            </div>
+          )}
         </div>
       )}
 
