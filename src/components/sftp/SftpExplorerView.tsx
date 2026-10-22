@@ -56,13 +56,30 @@ interface SftpExplorerViewProps {
   onOpenSshTab?: (connectionId?: string, config?: SshConfigParams) => void;
 }
 
+interface TransferProgressInfo {
+  direction: 'to-remote' | 'to-local';
+  file: string;
+  itemIndex: number;
+  totalItems: number;
+  transferredBytes: number;
+  totalBytes: number;
+  percent: number;
+  speedBytesPerSec: number;
+}
+
 function formatBytes(bytes: number, decimals = 1) {
-  if (bytes === 0) return '0 B';
+  if (!bytes || bytes <= 0 || !isFinite(bytes)) return '0 B';
   const k = 1024;
-  const dm = decimals < 0 ? 0 : decimals;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const dm = Math.max(0, decimals);
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
+  if (i < 0) return `${bytes.toFixed(dm)} B`;
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
+function formatSpeed(bytesPerSec: number) {
+  if (bytesPerSec <= 0 || !isFinite(bytesPerSec)) return '0 B/s';
+  return `${formatBytes(bytesPerSec)}/s`;
 }
 
 function formatDate(ms: number) {
@@ -129,7 +146,7 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
 
   // Transfer & Drag State
   const [isTransferring, setIsTransferring] = useState<boolean>(false);
-  const [transferStatus, setTransferStatus] = useState<string | null>(null);
+  const [transferProgress, setTransferProgress] = useState<TransferProgressInfo | null>(null);
   const [dragOverTarget, setDragOverTarget] = useState<'local' | 'remote' | null>(null);
   const [showHidden, setShowHidden] = useState<boolean>(defaultShowHidden);
 
@@ -148,6 +165,16 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
 
   const [transferToast, setTransferToast] = useState<{ message: string; type: 'info' | 'success' | 'error' } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const transferAbortControllerRef = useRef<AbortController | null>(null);
+
+  // Abort active transfers on component unmount to prevent leaks
+  useEffect(() => {
+    return () => {
+      if (transferAbortControllerRef.current) {
+        transferAbortControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   // Sync defaultShowHidden prop when changed externally in Settings
   useEffect(() => {
@@ -278,92 +305,191 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
     loadLocalDirectory(parent || '/');
   };
 
-  // --- Direct Streaming Transfers (Local <-> Remote) ---
-  const handleTransferToRemote = async (paths?: string[]) => {
-    const toTransfer = paths || Array.from(selectedLocalPaths);
+  // --- Direct Streaming Transfers (Local <-> Remote) with Real-Time Progress ---
+  const executeTransfer = async (direction: 'to-remote' | 'to-local', paths?: string[]) => {
+    const toTransfer = paths || Array.from(direction === 'to-remote' ? selectedLocalPaths : selectedRemotePaths);
     if (toTransfer.length === 0) {
-      showToast('Select local file(s) or folder(s) to transfer', 'info');
+      showToast(`Select ${direction === 'to-remote' ? 'local' : 'remote'} file(s) or folder(s) to transfer`, 'info');
       return;
     }
 
     const firstItemName = toTransfer[0]?.split('/').filter(Boolean).pop() || 'item';
-    const desc = toTransfer.length > 1 ? `${firstItemName} and ${toTransfer.length - 1} other item(s)` : `"${firstItemName}"`;
+    const targetDir = direction === 'to-remote' ? currentPath : localCurrentPath;
+
+    // Set up abort controller for this transfer session
+    if (transferAbortControllerRef.current) {
+      transferAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    transferAbortControllerRef.current = controller;
 
     setIsTransferring(true);
-    setTransferStatus(`Uploading ${desc} to remote server...`);
+    setTransferProgress({
+      direction,
+      file: firstItemName,
+      itemIndex: 1,
+      totalItems: toTransfer.length,
+      transferredBytes: 0,
+      totalBytes: 0,
+      percent: 0,
+      speedBytesPerSec: 0,
+    });
 
     try {
       const res = await fetch('/api/sftp/transfer', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+        },
         body: JSON.stringify({
-          direction: 'to-remote',
+          direction,
           sourcePaths: toTransfer,
-          targetDir: currentPath,
+          targetDir,
           connectionId,
           config: resolvedConfig,
+          stream: true,
         }),
+        signal: controller.signal,
       });
 
-      const data = await res.json();
-      if (res.ok && data.success) {
-        showToast(data.message || `Transferred ${toTransfer.length} item(s) to remote`, 'success');
+      if (!res.ok) {
+        let errMsg = 'Transfer request failed';
+        try {
+          const errData = await res.json();
+          errMsg = errData.error || errMsg;
+        } catch {}
+        throw new Error(errMsg);
+      }
+
+      const reader = res.body?.getReader();
+      if (!reader) {
+        // Fallback for non-streaming responses
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message || `Transferred ${toTransfer.length} item(s)`, 'success');
+        } else {
+          showToast(data.error || (data.errors ? data.errors.join(', ') : 'Transfer failed'), 'error');
+        }
+      } else {
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let lastTransferred = 0;
+        let lastTime = Date.now();
+        let currentSpeed = 0;
+        let lastFileName = '';
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const blocks = buffer.split('\n\n');
+            buffer = blocks.pop() || '';
+
+            for (const block of blocks) {
+              const trimmed = block.trim();
+              if (!trimmed.startsWith('data:')) continue;
+              const jsonStr = trimmed.slice(5).trim();
+              if (!jsonStr) continue;
+
+              let ev: any;
+              try {
+                ev = JSON.parse(jsonStr);
+              } catch (pErr) {
+                console.warn('[SFTP Progress Stream Parse Warning]', pErr);
+                continue;
+              }
+
+              if (ev.type === 'item_start') {
+                lastTransferred = 0;
+                lastTime = Date.now();
+                currentSpeed = 0;
+                lastFileName = ev.file;
+                setTransferProgress({
+                  direction,
+                  file: ev.file,
+                  itemIndex: ev.itemIndex,
+                  totalItems: ev.totalItems,
+                  transferredBytes: 0,
+                  totalBytes: 0,
+                  percent: 0,
+                  speedBytesPerSec: 0,
+                });
+              } else if (ev.type === 'progress') {
+                // If child file changed in a directory transfer, reset speed baseline
+                if (ev.file && ev.file !== lastFileName) {
+                  lastTransferred = 0;
+                  lastTime = Date.now();
+                  currentSpeed = 0;
+                  lastFileName = ev.file;
+                }
+
+                const now = Date.now();
+                const timeDiff = (now - lastTime) / 1000;
+                if (timeDiff >= 0.3) {
+                  const bytesDiff = ev.transferred - lastTransferred;
+                  if (bytesDiff >= 0) {
+                    currentSpeed = bytesDiff / timeDiff;
+                  }
+                  lastTransferred = ev.transferred;
+                  lastTime = now;
+                }
+
+                setTransferProgress({
+                  direction,
+                  file: ev.file,
+                  itemIndex: ev.itemIndex,
+                  totalItems: ev.totalItems,
+                  transferredBytes: ev.transferred,
+                  totalBytes: ev.total,
+                  percent: ev.percent,
+                  speedBytesPerSec: currentSpeed,
+                });
+              } else if (ev.type === 'item_error') {
+                showToast(`Failed transferring "${ev.file}": ${ev.error}`, 'error');
+              } else if (ev.type === 'done') {
+                if (ev.success) {
+                  showToast(ev.message || `Transferred ${toTransfer.length} item(s)`, 'success');
+                } else {
+                  showToast(ev.error || (ev.errors ? ev.errors.join(', ') : 'Transfer completed with errors'), 'error');
+                }
+              } else if (ev.type === 'error') {
+                throw new Error(ev.error);
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+
+      // Clear selections and refresh views
+      if (direction === 'to-remote') {
         setSelectedLocalPaths(new Set());
         loadDirectory(currentPath);
       } else {
-        showToast(data.error || (data.errors ? data.errors.join(', ') : 'Transfer to remote failed'), 'error');
-        loadDirectory(currentPath);
-      }
-    } catch (err: any) {
-      showToast(err.message || 'Transfer failed', 'error');
-    } finally {
-      setIsTransferring(false);
-      setTransferStatus(null);
-    }
-  };
-
-  const handleTransferToLocal = async (paths?: string[]) => {
-    const toTransfer = paths || Array.from(selectedRemotePaths);
-    if (toTransfer.length === 0) {
-      showToast('Select remote file(s) or folder(s) to transfer', 'info');
-      return;
-    }
-
-    const firstItemName = toTransfer[0]?.split('/').filter(Boolean).pop() || 'item';
-    const desc = toTransfer.length > 1 ? `${firstItemName} and ${toTransfer.length - 1} other item(s)` : `"${firstItemName}"`;
-
-    setIsTransferring(true);
-    setTransferStatus(`Downloading ${desc} to local machine...`);
-
-    try {
-      const res = await fetch('/api/sftp/transfer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          direction: 'to-local',
-          sourcePaths: toTransfer,
-          targetDir: localCurrentPath,
-          connectionId,
-          config: resolvedConfig,
-        }),
-      });
-
-      const data = await res.json();
-      if (res.ok && data.success) {
-        showToast(data.message || `Transferred ${toTransfer.length} item(s) to local`, 'success');
         setSelectedRemotePaths(new Set());
         loadLocalDirectory(localCurrentPath);
-      } else {
-        showToast(data.error || (data.errors ? data.errors.join(', ') : 'Transfer to local failed'), 'error');
-        loadLocalDirectory(localCurrentPath);
       }
     } catch (err: any) {
-      showToast(err.message || 'Transfer failed', 'error');
+      if (err.name !== 'AbortError') {
+        showToast(err.message || 'Transfer failed', 'error');
+      }
+      if (direction === 'to-remote') loadDirectory(currentPath);
+      else loadLocalDirectory(localCurrentPath);
     } finally {
+      if (transferAbortControllerRef.current === controller) {
+        transferAbortControllerRef.current = null;
+      }
       setIsTransferring(false);
-      setTransferStatus(null);
+      setTransferProgress(null);
     }
   };
+
+  const handleTransferToRemote = (paths?: string[]) => executeTransfer('to-remote', paths);
+  const handleTransferToLocal = (paths?: string[]) => executeTransfer('to-local', paths);
 
   // --- File Editor ---
   const handleOpenFile = async (item: SftpFileItem, target: 'local' | 'remote') => {
@@ -662,7 +788,7 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-zinc-950 overflow-hidden select-none">
+    <div className="flex-1 flex flex-col h-full bg-zinc-950 overflow-hidden select-none relative">
       {/* Top Main Toolbar */}
       <div className="h-10 bg-zinc-900/90 border-b border-zinc-800 flex items-center justify-between px-3 select-none shrink-0 gap-2">
         {/* Left: View Mode Toggle & Server Info */}
@@ -1419,13 +1545,107 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
         </div>
       </div>
 
-      {/* Active Transfer Floating Banner */}
-      {transferStatus && (
-        <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-2.5 rounded-xl shadow-2xl border bg-zinc-900 border-sky-500/60 text-xs text-zinc-100 backdrop-blur-md animate-in fade-in slide-in-from-bottom-2">
-          <RefreshCw className="w-4 h-4 text-sky-400 animate-spin shrink-0" />
-          <div className="flex flex-col gap-0.5">
-            <span className="font-semibold text-sky-300">{transferStatus}</span>
-            <span className="text-[10px] text-zinc-400">High-speed parallel SFTP transfer in progress. Please wait...</span>
+      {/* Active Transfer Floating Banner with Real-Time Progress Bar */}
+      {isTransferring && transferProgress && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-50 w-[360px] sm:w-[420px] bg-zinc-900/95 border border-zinc-700/80 rounded-xl shadow-2xl p-3.5 backdrop-blur-md flex flex-col gap-2.5 animate-in fade-in slide-in-from-bottom-3 select-none">
+          {/* Top Row: Direction icon + Filename + Item Counter + Percent */}
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0 flex-1">
+              <div
+                className={cn(
+                  'w-6 h-6 rounded-md flex items-center justify-center shrink-0 border text-xs font-semibold',
+                  transferProgress.direction === 'to-remote'
+                    ? 'bg-sky-500/15 border-sky-500/30 text-sky-400'
+                    : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
+                )}
+                title={transferProgress.direction === 'to-remote' ? 'Uploading to Remote Server' : 'Downloading to Local Machine'}
+              >
+                {transferProgress.direction === 'to-remote' ? (
+                  <ArrowRight className="w-3.5 h-3.5" />
+                ) : (
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                )}
+              </div>
+
+              <div className="flex flex-col min-w-0 flex-1">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="text-xs font-semibold text-zinc-100 truncate" title={transferProgress.file}>
+                    {transferProgress.file}
+                  </span>
+                  {transferProgress.totalItems > 1 && (
+                    <span className="text-[10px] text-zinc-400 font-mono shrink-0">
+                      ({transferProgress.itemIndex}/{transferProgress.totalItems})
+                    </span>
+                  )}
+                </div>
+                <span className="text-[10px] text-zinc-400">
+                  {transferProgress.direction === 'to-remote' ? 'Local ➔ Remote' : 'Remote ➔ Local'}
+                </span>
+              </div>
+            </div>
+
+            {/* Percentage badge */}
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span
+                className={cn(
+                  'text-xs font-bold font-mono tracking-tight',
+                  transferProgress.direction === 'to-remote' ? 'text-sky-400' : 'text-emerald-400'
+                )}
+              >
+                {transferProgress.totalBytes > 0 ? `${transferProgress.percent}%` : 'Transferring...'}
+              </span>
+            </div>
+          </div>
+
+          {/* Progress Bar Track */}
+          <div
+            role="progressbar"
+            aria-valuenow={transferProgress.percent}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label={`Transferring ${transferProgress.file}`}
+            className="w-full h-2 bg-zinc-800/90 rounded-full overflow-hidden p-0.5 border border-zinc-700/50 relative"
+          >
+            {transferProgress.totalBytes > 0 ? (
+              <div
+                className={cn(
+                  'h-full rounded-full transition-all duration-200 ease-out',
+                  transferProgress.direction === 'to-remote'
+                    ? 'bg-gradient-to-r from-sky-500 via-indigo-500 to-sky-400'
+                    : 'bg-gradient-to-r from-emerald-500 via-teal-400 to-emerald-400'
+                )}
+                style={{ width: `${Math.max(2, Math.min(100, transferProgress.percent))}%` }}
+              />
+            ) : (
+              <div
+                className={cn(
+                  'h-full w-2/5 rounded-full animate-pulse',
+                  transferProgress.direction === 'to-remote' ? 'bg-sky-500' : 'bg-emerald-500'
+                )}
+              />
+            )}
+          </div>
+
+          {/* Bottom Stats Row: Size transferred vs total + Transfer Speed */}
+          <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400 pt-0.5 border-t border-zinc-800/60">
+            <span className="truncate">
+              {transferProgress.totalBytes > 0 ? (
+                <>
+                  <span className="text-zinc-200 font-medium">
+                    {formatBytes(transferProgress.transferredBytes)}
+                  </span>
+                  {' / '}
+                  <span>{formatBytes(transferProgress.totalBytes)}</span>
+                </>
+              ) : (
+                <span className="text-zinc-300">Processing...</span>
+              )}
+            </span>
+
+            <div className="flex items-center gap-1.5 text-zinc-300 font-medium shrink-0">
+              <RefreshCw className="w-3 h-3 text-zinc-500 animate-spin" />
+              <span>{formatSpeed(transferProgress.speedBytesPerSec)}</span>
+            </div>
           </div>
         </div>
       )}

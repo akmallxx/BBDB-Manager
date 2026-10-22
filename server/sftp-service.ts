@@ -284,26 +284,47 @@ export function chmodRemoteItem(sftp: SFTPWrapper, remotePath: string, mode: num
   });
 }
 
+export type TransferProgressCallback = (transferred: number, total: number, file: string) => void;
+
 /**
  * High-speed parallel transfer of a single local file to remote SFTP using fastPut
  */
-export async function transferLocalFileToRemote(sftp: SFTPWrapper, localFilePath: string, remoteDestPath: string): Promise<void> {
+export async function transferLocalFileToRemote(
+  sftp: SFTPWrapper,
+  localFilePath: string,
+  remoteDestPath: string,
+  onProgress?: TransferProgressCallback
+): Promise<void> {
   const stat = await fs.promises.stat(localFilePath);
+  const fileName = path.basename(localFilePath);
+
   if (stat.size === 0) {
-    return writeRemoteFile(sftp, remoteDestPath, Buffer.alloc(0));
+    if (onProgress) onProgress(0, 0, fileName);
+    await writeRemoteFile(sftp, remoteDestPath, Buffer.alloc(0));
+    if (onProgress) onProgress(0, 0, fileName);
+    return;
   }
 
   return new Promise((resolve, reject) => {
+    let lastTime = 0;
     const options = {
       concurrency: 64,
       chunkSize: 32768,
       mode: stat.mode,
+      step: (total: number, nb: number, fsize: number) => {
+        const now = Date.now();
+        if (now - lastTime > 150 || total === fsize) {
+          lastTime = now;
+          if (onProgress) onProgress(total, fsize, fileName);
+        }
+      }
     };
 
     (sftp as any).fastPut(localFilePath, remoteDestPath, options, (err: any) => {
       if (err) {
-        return reject(new Error(`Failed to upload "${path.basename(localFilePath)}" to remote: ${err.message}`));
+        return reject(new Error(`Failed to upload "${fileName}" to remote: ${err.message}`));
       }
+      if (onProgress) onProgress(stat.size, stat.size, fileName);
       resolve();
     });
   });
@@ -312,23 +333,42 @@ export async function transferLocalFileToRemote(sftp: SFTPWrapper, localFilePath
 /**
  * High-speed parallel transfer of a single remote SFTP file to local filesystem using fastGet
  */
-export function transferRemoteFileToLocal(sftp: SFTPWrapper, remoteFilePath: string, localDestPath: string): Promise<void> {
+export function transferRemoteFileToLocal(
+  sftp: SFTPWrapper,
+  remoteFilePath: string,
+  localDestPath: string,
+  onProgress?: TransferProgressCallback
+): Promise<void> {
   return new Promise((resolve, reject) => {
     sftp.stat(remoteFilePath, (statErr, stats) => {
       if (statErr) {
         return reject(new Error(`Failed to stat remote file "${remoteFilePath}": ${statErr.message}`));
       }
 
+      const fileName = path.basename(remoteFilePath);
+
       if (stats.size === 0) {
+        if (onProgress) onProgress(0, 0, fileName);
         fs.promises.writeFile(localDestPath, Buffer.alloc(0))
-          .then(() => resolve())
+          .then(() => {
+            if (onProgress) onProgress(0, 0, fileName);
+            resolve();
+          })
           .catch((err) => reject(new Error(`Failed to create local file "${localDestPath}": ${err.message}`)));
         return;
       }
 
+      let lastTime = 0;
       const options = {
         concurrency: 64,
         chunkSize: 32768,
+        step: (total: number, nb: number, fsize: number) => {
+          const now = Date.now();
+          if (now - lastTime > 150 || total === fsize) {
+            lastTime = now;
+            if (onProgress) onProgress(total, fsize, fileName);
+          }
+        }
       };
 
       (sftp as any).fastGet(remoteFilePath, localDestPath, options, (err: any) => {
@@ -336,8 +376,9 @@ export function transferRemoteFileToLocal(sftp: SFTPWrapper, remoteFilePath: str
           try {
             if (fs.existsSync(localDestPath)) fs.unlinkSync(localDestPath);
           } catch {}
-          return reject(new Error(`Failed to download "${path.basename(remoteFilePath)}" to local: ${err.message}`));
+          return reject(new Error(`Failed to download "${fileName}" to local: ${err.message}`));
         }
+        if (onProgress) onProgress(stats.size, stats.size, fileName);
         resolve();
       });
     });
@@ -347,7 +388,12 @@ export function transferRemoteFileToLocal(sftp: SFTPWrapper, remoteFilePath: str
 /**
  * Recursively transfer local file or directory to remote SFTP destination directory
  */
-export async function transferLocalItemToRemote(sftp: SFTPWrapper, localPath: string, remoteDir: string): Promise<void> {
+export async function transferLocalItemToRemote(
+  sftp: SFTPWrapper,
+  localPath: string,
+  remoteDir: string,
+  onProgress?: TransferProgressCallback
+): Promise<void> {
   const stat = await fs.promises.stat(localPath);
   const itemName = path.basename(path.resolve(localPath));
   const cleanRemoteDir = remoteDir.endsWith('/') && remoteDir.length > 1 ? remoteDir.slice(0, -1) : remoteDir;
@@ -361,17 +407,22 @@ export async function transferLocalItemToRemote(sftp: SFTPWrapper, localPath: st
     }
     const children = await fs.promises.readdir(localPath);
     for (const child of children) {
-      await transferLocalItemToRemote(sftp, path.join(localPath, child), targetRemotePath);
+      await transferLocalItemToRemote(sftp, path.join(localPath, child), targetRemotePath, onProgress);
     }
   } else {
-    await transferLocalFileToRemote(sftp, localPath, targetRemotePath);
+    await transferLocalFileToRemote(sftp, localPath, targetRemotePath, onProgress);
   }
 }
 
 /**
  * Recursively transfer remote SFTP file or directory to local destination directory
  */
-export async function transferRemoteItemToLocal(sftp: SFTPWrapper, remotePath: string, localDir: string): Promise<void> {
+export async function transferRemoteItemToLocal(
+  sftp: SFTPWrapper,
+  remotePath: string,
+  localDir: string,
+  onProgress?: TransferProgressCallback
+): Promise<void> {
   const stat = await new Promise<Stats>((resolve, reject) => {
     sftp.stat(remotePath, (err, stats) => {
       if (err) return reject(err);
@@ -396,9 +447,9 @@ export async function transferRemoteItemToLocal(sftp: SFTPWrapper, remotePath: s
     for (const child of list) {
       if (child.filename === '.' || child.filename === '..') continue;
       const childRemotePath = remotePath.endsWith('/') ? `${remotePath}${child.filename}` : `${remotePath}/${child.filename}`;
-      await transferRemoteItemToLocal(sftp, childRemotePath, targetLocalPath);
+      await transferRemoteItemToLocal(sftp, childRemotePath, targetLocalPath, onProgress);
     }
   } else {
-    await transferRemoteFileToLocal(sftp, remotePath, targetLocalPath);
+    await transferRemoteFileToLocal(sftp, remotePath, targetLocalPath, onProgress);
   }
 }

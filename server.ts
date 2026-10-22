@@ -23,7 +23,8 @@ import {
   chmodRemoteItem,
   closeSftpSession,
   transferLocalItemToRemote,
-  transferRemoteItemToLocal
+  transferRemoteItemToLocal,
+  type TransferProgressCallback
 } from './server/sftp-service.ts';
 import {
   listLocalDirectory,
@@ -1889,11 +1890,36 @@ app.post('/api/local/rename', async (req, res) => {
   }
 });
 
-// Direct Transfer endpoint (Local <-> Remote SFTP)
+// Direct Transfer endpoint (Local <-> Remote SFTP) with real-time SSE progress streaming
 app.post('/api/sftp/transfer', async (req, res) => {
   // Prevent socket timeout during large file transfers
   req.setTimeout(0);
   res.setTimeout(0);
+
+  const isStream = Boolean(
+    req.headers.accept?.includes('text/event-stream') ||
+    req.body?.stream === true ||
+    req.query?.stream === 'true'
+  );
+
+  if (isStream) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+  }
+
+  const sendEvent = (data: any) => {
+    if (isStream && !res.writableEnded && !res.destroyed) {
+      try {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        (res as any).flush?.();
+      } catch (writeErr) {
+        console.warn('[SFTP SSE Write Error]', writeErr);
+      }
+    }
+  };
 
   try {
     const { sessionKey, config } = resolveSshConfigFromReq(req);
@@ -1902,36 +1928,115 @@ app.post('/api/sftp/transfer', async (req, res) => {
     const targetDir = req.body.targetDir as string;
 
     if (!direction || !Array.isArray(sourcePaths) || sourcePaths.length === 0 || !targetDir) {
+      if (isStream) {
+        sendEvent({ type: 'error', error: 'direction, sourcePaths, and targetDir are required' });
+        if (!res.writableEnded && !res.destroyed) res.end();
+        return;
+      }
       return res.status(400).json({ error: 'direction, sourcePaths, and targetDir are required' });
     }
 
     const transferred: string[] = [];
     const errors: string[] = [];
+    const totalItems = sourcePaths.length;
+
+    sendEvent({
+      type: 'start',
+      direction,
+      totalItems
+    });
 
     await withSftpSession(sessionKey, config, async (sftp) => {
+      let itemIndex = 0;
       for (const src of sourcePaths) {
+        if (req.destroyed || res.destroyed) {
+          console.log('[SFTP Transfer Aborted by client]');
+          break;
+        }
+
+        itemIndex++;
+        const fileName = path.basename(src);
+
+        sendEvent({
+          type: 'item_start',
+          direction,
+          file: fileName,
+          itemIndex,
+          totalItems
+        });
+
+        const onProgress: TransferProgressCallback = (transferredBytes, totalBytes, file) => {
+          sendEvent({
+            type: 'progress',
+            direction,
+            file,
+            itemIndex,
+            totalItems,
+            transferred: transferredBytes,
+            total: totalBytes,
+            percent: totalBytes > 0 ? Math.min(100, Math.round((transferredBytes / totalBytes) * 100)) : 100
+          });
+        };
+
         try {
           if (direction === 'to-remote') {
-            await transferLocalItemToRemote(sftp, src, targetDir);
+            await transferLocalItemToRemote(sftp, src, targetDir, onProgress);
           } else {
-            await transferRemoteItemToLocal(sftp, src, targetDir);
+            await transferRemoteItemToLocal(sftp, src, targetDir, onProgress);
           }
           transferred.push(src);
+          sendEvent({
+            type: 'item_done',
+            direction,
+            file: fileName,
+            itemIndex,
+            totalItems
+          });
         } catch (itemErr: any) {
           console.error(`[SFTP Transfer Error on ${src}]`, itemErr);
-          errors.push(`${path.basename(src)}: ${itemErr.message}`);
+          errors.push(`${fileName}: ${itemErr.message}`);
+          sendEvent({
+            type: 'item_error',
+            direction,
+            file: fileName,
+            itemIndex,
+            totalItems,
+            error: itemErr.message
+          });
         }
       }
     });
 
-    res.json({
+    const result = {
       success: errors.length === 0,
       transferred,
       errors: errors.length > 0 ? errors : undefined,
       message: `Transferred ${transferred.length} item(s)${errors.length > 0 ? ` (${errors.length} failed)` : ''}`
-    });
+    };
+
+    if (isStream) {
+      if (!res.writableEnded && !res.destroyed) {
+        sendEvent({
+          type: 'done',
+          ...result
+        });
+        res.end();
+      }
+    } else {
+      res.json(result);
+    }
   } catch (err: any) {
-    handleSftpError(res, err, 'Transfer failed');
+    if (isStream) {
+      if (!res.writableEnded && !res.destroyed) {
+        sendEvent({
+          type: 'error',
+          error: err.message || 'Transfer failed'
+        });
+        res.end();
+      }
+    } else {
+      handleSftpError(res, err, 'Transfer failed');
+    }
   }
 });
 

@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Interactive Drag & Drop: drag files or folders directly between Local and Remote panes to initiate transfer with visual drop target highlighting.
   - Multi-select checkbox support across both panes to batch transfer multiple files and folders at once.
   - Recursive directory transfer handling for nested folders in both directions (local-to-remote and remote-to-local).
+- **Real-Time Transfer Progress Bar & Live Speed Tracking**:
+  - Replaced static loading banner with a sleek floating transfer card displaying:
+    - Directional badge with animated pulse arrow (`Local ➔ Remote` or `Remote ➔ Local`).
+    - Active filename and batch item counter (e.g. `1/3`).
+    - High-precision percentage counter (`0%` to `100%`).
+    - Smooth animated gradient progress bar (`sky-to-indigo` for uploads, `emerald-to-teal` for downloads).
+    - Real-time transferred bytes vs total file size display (e.g. `245.8 MB / 1.2 GB`).
+    - Live transfer speed calculation (e.g. `38.4 MB/s`) measured over rolling 300ms windows.
+  - Server-Sent Events (SSE) streaming protocol via `/api/sftp/transfer` for zero-lag progress updates.
+  - Full client disconnect protection, reader lock cleanup, and `AbortController` integration on component unmount.
+- **High-Speed Parallel SFTP Engine**:
+  - Replaced sequential single-stream transfer with `ssh2` pipelined `fastGet` and `fastPut` algorithms using 64 concurrent chunk pipelines.
+  - Uncapped HTTP socket timeouts for multi-gigabyte database dumps and archive files.
 - **Local Filesystem Service**:
   - Secure backend service (`server/local-fs-service.ts`) providing directory listing, folder creation, deletion, and renaming for the local machine.
 
