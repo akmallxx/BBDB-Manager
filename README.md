@@ -22,7 +22,7 @@
 
 ## Overview
 
-BBDB Manager provides an interface for querying, modifying, and managing relational databases. It supports direct connections and SSH tunneling, with manual transaction control for production environments. It runs in modern web browsers or as a standalone desktop application via Tauri v2.
+BBDB Manager provides an interface for querying, modifying, and managing relational databases and remote SSH servers. It supports direct connections, SSH tunneling, interactive remote terminal sessions, SFTP file management, and manual transaction control for production environments. It runs in modern web browsers or as a standalone desktop application via Tauri v2.
 
 ---
 
@@ -30,14 +30,16 @@ BBDB Manager provides an interface for querying, modifying, and managing relatio
 
 ### Connection Management
 - Database drivers: PostgreSQL, MySQL / MariaDB, SQLite, and SQL Server (MSSQL).
+- Direct SSH Server connections for remote DevOps, terminal sessions, and SFTP file management.
 - Network security: SSL encryption and SSH tunneling (password or private key with passphrase).
 - Environment tagging: Label connections as Development, Staging, or Production with color indicators.
 - Read-only mode: Enforceable read-only toggle to prevent write operations.
+- Dual Workspace: Dedicated Database Workspace and Remote SSH Workspace with auto-collapsing sidebar.
 
 ### SQL Query Editor
-- Syntax highlighting for SQL keywords, functions, literals, and comments.
+- Syntax highlighting with high-contrast themes for both Light and Dark modes.
 - SQL formatter to indent and structure queries.
-- Execute selection or entire script with keyboard shortcut (`Ctrl + Enter`).
+- Execute selection or entire script with customizable keyboard shortcut (default `Ctrl + Enter`).
 - Resizable and collapsible query result tray.
 - Inline cell editing in result grids with primary key detection.
 - Export results to CSV, JSON, or SQL INSERT statements.
@@ -68,18 +70,45 @@ BBDB Manager provides an interface for querying, modifying, and managing relatio
   - Truncate table
   - Copy table identifier or SELECT statement
 
+### Remote SSH Terminal & SFTP Explorer
+- **xterm.js Terminal Sessions**: Full interactive SSH terminal over WebSockets with font size scaling, cursor styles (block, underline, bar), and zoom controls.
+- **Dynamic Terminal Theming**: Automatic live switching between crisp light and dark terminal backgrounds matching app preferences.
+- **Keepalive Packets**: Periodic background keepalive pings preventing idle connection drops.
+- **SFTP File Browser**: Graphical remote directory tree, file metadata (sizes, permissions octal, timestamps), in-app text editor/viewer, chunked uploads up to 100MB, streaming downloads, and remote chmod.
+
+### Terminal Snippets Manager
+- Right-hand collapsible snippet drawer directly inside terminal tabs.
+- Template variables support with dynamic interactive prompts (e.g. `{{service:nginx}}`).
+- Snippet categorization, search filtering, favorites, and 3-dots action menu (Copy, Edit, Delete).
+- Centrally stored in SQLite with full CRUD REST API endpoints.
+
+### Studio Settings & Preferences
+- Centralized preferences stored in SQLite `app_settings` (`data/database-studio.sqlite`).
+- Customization options:
+  - Theme (Dark / Light Mode)
+  - Font sizes & query fetch limits
+  - Terminal cursor style & font size
+  - SFTP hidden files visibility toggle
+  - Database storage statistics and query history maintenance
+
 ---
 
 ## Keyboard Shortcuts
 
-| Shortcut | Action | Description |
-| :--- | :--- | :--- |
-| `Ctrl + Enter` | Execute SQL | Run active query or selected text |
-| `Ctrl + W` / `Alt + W` | Close Tab | Close active workspace tab |
-| `Alt + T` / `Ctrl + Shift + N` | New Query Tab | Open a new SQL Editor tab |
-| `Ctrl + Shift + Q` | Disconnect | Close active database connection |
-| Double Click | Inline Edit | Edit value in grid cell |
-| `Escape` | Dismiss | Cancel inline edit or close open modals |
+All shortcuts are fully customizable via **Studio Settings (`Ctrl + ,`) -> Keyboard Shortcuts** using an interactive key recorder with conflict detection and reset capabilities.
+
+| Default Shortcut | Action ID | Action | Description |
+| :--- | :--- | :--- | :--- |
+| `Alt + T` | `new_query` | New Query Tab | Open a new SQL Editor tab |
+| `Ctrl + W` | `close_tab` | Close Active Tab | Close currently selected workspace tab |
+| `Ctrl + B` | `toggle_sidebar` | Toggle Sidebar | Collapse or expand connection & schema sidebar |
+| `Ctrl + ,` | `open_settings` | Studio Settings | Open or close Studio Settings & Preferences modal |
+| `Alt + S` | `new_terminal` | New Terminal Tab | Open a new remote SSH terminal session tab |
+| `Ctrl + Shift + Q` | `disconnect` | Disconnect Session | Safely disconnect active database connection |
+| `Ctrl + Enter` | `run_query` | Execute SQL Query | Run active query or selected SQL statement |
+| `Ctrl + Shift + A` | `toggle_autocommit` | Toggle Autocommit | Switch between autocommit and manual transaction mode |
+| Double Click | — | Inline Edit | Edit value in table grid cell |
+| `Escape` | — | Dismiss | Cancel inline edit or close open modals |
 
 ---
 
