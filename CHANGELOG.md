@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.3.0] - 2026-10-22
+## [1.2.1] - 2026-10-22
 
 ### Added
 - **Side-by-Side (Dual-Pane) SFTP Explorer**:
@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Full client disconnect protection, reader lock cleanup, and `AbortController` integration on component unmount.
 - **Instant Transfer Cancellation (Abort)**:
   - Interactive Cancel button (`X`) directly inside the floating transfer banner and global `Escape` keyboard shortcut.
-  - Instant abort mechanism leveraging `AbortController` and server-side socket disconnect detection (`req.on('close')`).
+  - Instant abort mechanism leveraging `AbortController` and server-side socket disconnect detection (`res.on('close')`).
   - Automatic SFTP channel termination (`closeSftpSession`) stopping in-flight `fastGet`/`fastPut` pipelines in milliseconds.
   - Automatic cleanup of incomplete/corrupt local files upon cancelled downloads.
 - **High-Speed Parallel SFTP Engine**:
@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Uncapped HTTP socket timeouts for multi-gigabyte database dumps and archive files.
 - **Local Filesystem Service**:
   - Secure backend service (`server/local-fs-service.ts`) providing directory listing, folder creation, deletion, and renaming for the local machine.
+
+### Fixed
+- **Premature SFTP Transfer Abort**: Fixed an issue where transfers aborted at second 0 because Express marks incoming HTTP POST streams (`req`) as closed after consuming JSON request bodies; switched to tracking outgoing response streams (`res.on('close')` and `!res.writableEnded`).
+- **Recursive Folder Abort Propagation**: Propagated cancellation checks down into nested directories during recursive transfers to immediately interrupt child traversals upon abort.
+- **Async State Guard**: Added component mount safety guards (`isMountedRef`) in SFTP Explorer to eliminate memory leaks and unmounted state updates during asynchronous file operations.
 
 ## [1.2.0] - 2026-10-22
 

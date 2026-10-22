@@ -2,7 +2,7 @@
   "name": "bbdb-manager",
   "description": "BBDB Manager - Modern Beekeeper-like Database Studio",
   "private": true,
-  "version": "1.3.0",
+  "version": "1.2.1",
   "type": "module",
   "scripts": {
     "dev": "tsx watch server.ts",
