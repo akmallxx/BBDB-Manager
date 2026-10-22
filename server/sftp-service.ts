@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { Client as SSHClient, type SFTPWrapper } from 'ssh2';
 import { createSshClient, type SshConnectionConfig } from './ssh-service';
 import type { Stats } from 'ssh2';
@@ -37,8 +39,9 @@ setInterval(() => {
 }, 60000);
 
 export function parsePermissions(mode: number): string {
-  const isDir = (mode & 0o40000) === 0o40000;
-  const isLink = (mode & 0o120000) === 0o120000;
+  const S_IFMT = 0o170000;
+  const isDir = (mode & S_IFMT) === 0o040000;
+  const isLink = (mode & S_IFMT) === 0o120000;
   const prefix = isDir ? 'd' : isLink ? 'l' : '-';
 
   const u = [
@@ -158,8 +161,9 @@ export function listRemoteDirectory(sftp: SFTPWrapper, targetPath: string): Prom
 
         const items: SftpFileItem[] = list.map((item) => {
           const mode = item.attrs.mode || 0;
-          const isDir = (mode & 0o40000) === 0o40000;
-          const isLink = (mode & 0o120000) === 0o120000;
+          const S_IFMT = 0o170000;
+          const isDir = (mode & S_IFMT) === 0o040000;
+          const isLink = (mode & S_IFMT) === 0o120000;
 
           let type: 'file' | 'directory' | 'symlink' | 'other' = 'file';
           if (isDir) type = 'directory';
@@ -278,4 +282,136 @@ export function chmodRemoteItem(sftp: SFTPWrapper, remotePath: string, mode: num
       resolve();
     });
   });
+}
+
+/**
+ * Transfer a single local file to remote SFTP
+ */
+export function transferLocalFileToRemote(sftp: SFTPWrapper, localFilePath: string, remoteDestPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const readStream = fs.createReadStream(localFilePath);
+    const writeStream = sftp.createWriteStream(remoteDestPath);
+
+    const cleanupAndReject = (err: any) => {
+      if (settled) return;
+      settled = true;
+      try { readStream.destroy(); } catch {}
+      try { writeStream.destroy(); } catch {}
+      reject(err);
+    };
+
+    readStream.on('error', (err: any) => {
+      cleanupAndReject(new Error(`Failed to read local file "${localFilePath}": ${err.message}`));
+    });
+
+    writeStream.on('error', (err: any) => {
+      cleanupAndReject(new Error(`Failed to write remote file "${remoteDestPath}": ${err.message}`));
+    });
+
+    writeStream.on('close', () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    });
+
+    readStream.pipe(writeStream);
+  });
+}
+
+/**
+ * Transfer a single remote SFTP file to local filesystem
+ */
+export function transferRemoteFileToLocal(sftp: SFTPWrapper, remoteFilePath: string, localDestPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const readStream = sftp.createReadStream(remoteFilePath);
+    const writeStream = fs.createWriteStream(localDestPath);
+
+    const cleanupAndReject = (err: any) => {
+      if (settled) return;
+      settled = true;
+      try { readStream.destroy(); } catch {}
+      try { writeStream.destroy(); } catch {}
+      try {
+        if (fs.existsSync(localDestPath)) fs.unlinkSync(localDestPath);
+      } catch {}
+      reject(err);
+    };
+
+    readStream.on('error', (err: any) => {
+      cleanupAndReject(new Error(`Failed to read remote file "${remoteFilePath}": ${err.message}`));
+    });
+
+    writeStream.on('error', (err: any) => {
+      cleanupAndReject(new Error(`Failed to write local file "${localDestPath}": ${err.message}`));
+    });
+
+    writeStream.on('close', () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    });
+
+    readStream.pipe(writeStream);
+  });
+}
+
+/**
+ * Recursively transfer local file or directory to remote SFTP destination directory
+ */
+export async function transferLocalItemToRemote(sftp: SFTPWrapper, localPath: string, remoteDir: string): Promise<void> {
+  const stat = await fs.promises.stat(localPath);
+  const itemName = path.basename(path.resolve(localPath));
+  const cleanRemoteDir = remoteDir.endsWith('/') && remoteDir.length > 1 ? remoteDir.slice(0, -1) : remoteDir;
+  const targetRemotePath = cleanRemoteDir === '/' ? `/${itemName}` : `${cleanRemoteDir}/${itemName}`;
+
+  if (stat.isDirectory()) {
+    try {
+      await makeRemoteDirectory(sftp, targetRemotePath);
+    } catch {
+      // directory might already exist, continue
+    }
+    const children = await fs.promises.readdir(localPath);
+    for (const child of children) {
+      await transferLocalItemToRemote(sftp, path.join(localPath, child), targetRemotePath);
+    }
+  } else {
+    await transferLocalFileToRemote(sftp, localPath, targetRemotePath);
+  }
+}
+
+/**
+ * Recursively transfer remote SFTP file or directory to local destination directory
+ */
+export async function transferRemoteItemToLocal(sftp: SFTPWrapper, remotePath: string, localDir: string): Promise<void> {
+  const stat = await new Promise<Stats>((resolve, reject) => {
+    sftp.stat(remotePath, (err, stats) => {
+      if (err) return reject(err);
+      resolve(stats);
+    });
+  });
+
+  const cleanRemotePath = remotePath.endsWith('/') && remotePath.length > 1 ? remotePath.slice(0, -1) : remotePath;
+  const itemName = path.basename(cleanRemotePath);
+  const targetLocalPath = path.join(localDir, itemName);
+
+  const S_IFMT = 0o170000;
+  const isDir = (stat.mode & S_IFMT) === 0o040000;
+  if (isDir) {
+    await fs.promises.mkdir(targetLocalPath, { recursive: true });
+    const list = await new Promise<any[]>((resolve, reject) => {
+      sftp.readdir(remotePath, (err, items) => {
+        if (err) return reject(err);
+        resolve(items);
+      });
+    });
+    for (const child of list) {
+      if (child.filename === '.' || child.filename === '..') continue;
+      const childRemotePath = remotePath.endsWith('/') ? `${remotePath}${child.filename}` : `${remotePath}/${child.filename}`;
+      await transferRemoteItemToLocal(sftp, childRemotePath, targetLocalPath);
+    }
+  } else {
+    await transferRemoteFileToLocal(sftp, remotePath, targetLocalPath);
+  }
 }

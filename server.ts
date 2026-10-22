@@ -21,8 +21,16 @@ import {
   deleteRemoteItem,
   renameRemoteItem,
   chmodRemoteItem,
-  closeSftpSession
+  closeSftpSession,
+  transferLocalItemToRemote,
+  transferRemoteItemToLocal
 } from './server/sftp-service.ts';
+import {
+  listLocalDirectory,
+  createLocalDirectory,
+  deleteLocalItem,
+  renameLocalItem
+} from './server/local-fs-service.ts';
 import {
   getAdapter,
   createAdapter,
@@ -1831,6 +1839,98 @@ app.post('/api/sftp/disconnect', (req, res) => {
   }
   res.json({ success: true });
 });
+
+// Local File System endpoints for Dual-Pane SFTP
+app.post('/api/local/list', async (req, res) => {
+  try {
+    const targetPath = (req.body.path as string) || undefined;
+    const result = await listLocalDirectory(targetPath);
+    res.json(result);
+  } catch (err: any) {
+    console.error('[Local-FS List Error]', err);
+    res.status(500).json({ error: err.message || 'Failed to list local directory' });
+  }
+});
+
+app.post('/api/local/mkdir', async (req, res) => {
+  try {
+    const targetPath = req.body.path as string;
+    if (!targetPath) return res.status(400).json({ error: 'path is required' });
+    await createLocalDirectory(targetPath);
+    res.json({ success: true, message: `Created directory ${targetPath}` });
+  } catch (err: any) {
+    console.error('[Local-FS Mkdir Error]', err);
+    res.status(500).json({ error: err.message || 'Failed to create directory' });
+  }
+});
+
+app.post('/api/local/delete', async (req, res) => {
+  try {
+    const targetPath = req.body.path as string;
+    if (!targetPath) return res.status(400).json({ error: 'path is required' });
+    await deleteLocalItem(targetPath);
+    res.json({ success: true, message: `Deleted ${targetPath}` });
+  } catch (err: any) {
+    console.error('[Local-FS Delete Error]', err);
+    res.status(500).json({ error: err.message || 'Failed to delete item' });
+  }
+});
+
+app.post('/api/local/rename', async (req, res) => {
+  try {
+    const oldPath = req.body.oldPath as string;
+    const newPath = req.body.newPath as string;
+    if (!oldPath || !newPath) return res.status(400).json({ error: 'oldPath and newPath are required' });
+    await renameLocalItem(oldPath, newPath);
+    res.json({ success: true, message: `Renamed to ${newPath}` });
+  } catch (err: any) {
+    console.error('[Local-FS Rename Error]', err);
+    res.status(500).json({ error: err.message || 'Failed to rename item' });
+  }
+});
+
+// Direct Transfer endpoint (Local <-> Remote SFTP)
+app.post('/api/sftp/transfer', async (req, res) => {
+  try {
+    const { sessionKey, config } = resolveSshConfigFromReq(req);
+    const direction = req.body.direction as 'to-remote' | 'to-local';
+    const sourcePaths = req.body.sourcePaths as string[];
+    const targetDir = req.body.targetDir as string;
+
+    if (!direction || !Array.isArray(sourcePaths) || sourcePaths.length === 0 || !targetDir) {
+      return res.status(400).json({ error: 'direction, sourcePaths, and targetDir are required' });
+    }
+
+    const transferred: string[] = [];
+    const errors: string[] = [];
+
+    await withSftpSession(sessionKey, config, async (sftp) => {
+      for (const src of sourcePaths) {
+        try {
+          if (direction === 'to-remote') {
+            await transferLocalItemToRemote(sftp, src, targetDir);
+          } else {
+            await transferRemoteItemToLocal(sftp, src, targetDir);
+          }
+          transferred.push(src);
+        } catch (itemErr: any) {
+          console.error(`[SFTP Transfer Error on ${src}]`, itemErr);
+          errors.push(`${path.basename(src)}: ${itemErr.message}`);
+        }
+      }
+    });
+
+    res.json({
+      success: errors.length === 0,
+      transferred,
+      errors: errors.length > 0 ? errors : undefined,
+      message: `Transferred ${transferred.length} item(s)${errors.length > 0 ? ` (${errors.length} failed)` : ''}`
+    });
+  } catch (err: any) {
+    handleSftpError(res, err, 'Transfer failed');
+  }
+});
+
 
 // Vite Integration (Dev Middleware or Production Static)
 async function startServer() {
