@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BBDB Manager",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "identifier": "com.bbdb.manager",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "devUrl": "http://localhost:39000",
+    "devUrl": "http://localhost:39001",
     "beforeBuildCommand": "bun run build && bun run scripts/build-server.ts",
     "frontendDist": "../dist"
   },
