@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Secure backend service (`server/local-fs-service.ts`) providing directory listing, folder creation, deletion, and renaming for the local machine.
 
 ### Fixed
+- **Windows Silent Background Execution (Zero Terminal Popup)**: Fixed an issue where launching desktop builds (`.exe` / `.msi`) on Windows spawned a command prompt terminal window; added `CREATE_NO_WINDOW` flag, redirected backend stdout/stderr quietly to rotating `backend.log`, and bound server exclusively to loopback `127.0.0.1` to prevent Windows Defender Firewall prompts.
+- **Desktop Process Lifecycle & Zombie Cleanup**: Hooked Tauri's window destroy event to cleanly terminate the backend child process and wait for its exit, preventing background zombie processes when the app window is closed.
+- **Windows Binary & Path Resolution**: Enhanced binary resolution to support Windows `.exe` executable extensions, exact executable matching, and unified data directory lookup across platforms.
 - **Premature SFTP Transfer Abort**: Fixed an issue where transfers aborted at second 0 because Express marks incoming HTTP POST streams (`req`) as closed after consuming JSON request bodies; switched to tracking outgoing response streams (`res.on('close')` and `!res.writableEnded`).
 - **Recursive Folder Abort Propagation**: Propagated cancellation checks down into nested directories during recursive transfers to immediately interrupt child traversals upon abort.
 - **Async State Guard**: Added component mount safety guards (`isMountedRef`) in SFTP Explorer to eliminate memory leaks and unmounted state updates during asynchronous file operations.

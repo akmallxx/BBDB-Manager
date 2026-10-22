@@ -4,25 +4,98 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 static BACKEND_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
+fn get_data_dir() -> PathBuf {
+    // 1. Windows USERPROFILE or Linux/macOS HOME (matches server.ts os.homedir()/.bbdb-manager)
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        let p = PathBuf::from(home).join(".bbdb-manager");
+        let _ = std::fs::create_dir_all(&p);
+        return p;
+    }
+
+    // 2. Windows AppData fallback
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let p = PathBuf::from(appdata).join("bbdb-manager");
+        let _ = std::fs::create_dir_all(&p);
+        return p;
+    }
+
+    // 3. Fallback to local .bbdb-manager folder
+    let p = PathBuf::from(".bbdb-manager");
+    let _ = std::fs::create_dir_all(&p);
+    p
+}
+
+fn apply_silent_spawn_options(cmd: &mut Command, data_dir: &PathBuf) {
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    // Redirect stdout and stderr quietly to backend.log so errors can be inspected without popping up a console
+    let log_path = data_dir.join("backend.log");
+    if let Ok(log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        if let Ok(err_file) = log_file.try_clone() {
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(err_file));
+            return;
+        }
+    }
+
+    // Fallback: completely suppress if log file cannot be opened
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+}
+
 fn find_server_binary() -> Option<PathBuf> {
-    // 1. Check directory containing current running executable (e.g. /usr/bin/ or target/release/)
+    let exe_extensions: &[&str] = if cfg!(windows) {
+        &[".exe", ""]
+    } else {
+        &[""]
+    };
+
+    let is_valid_binary_name = |fname: &str| -> bool {
+        if !fname.starts_with("bbdb-server") {
+            return false;
+        }
+        if cfg!(windows) {
+            fname.ends_with(".exe")
+        } else {
+            !fname.ends_with(".d") && !fname.ends_with(".pdb") && !fname.contains('.')
+        }
+    };
+
+    // 1. Check directory containing current running executable (e.g. C:\Program Files\BBDB Manager or /usr/bin/)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            // Check direct binary name: /usr/bin/bbdb-server or target/release/bbdb-server
-            let candidate = exe_dir.join("bbdb-server");
-            if candidate.is_file() {
-                return Some(candidate);
+            // Check direct binary name: bbdb-server, bbdb-server.exe
+            for ext in exe_extensions {
+                let candidate = exe_dir.join(format!("bbdb-server{}", ext));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
 
-            // Check target-suffixed binary in exe_dir
+            // Check target-suffixed binary in exe_dir (e.g. bbdb-server-x86_64-pc-windows-msvc.exe)
             if let Ok(entries) = std::fs::read_dir(exe_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                            if fname.starts_with("bbdb-server") && !fname.ends_with(".d") {
+                            if is_valid_binary_name(fname) {
                                 return Some(path);
                             }
                         }
@@ -38,7 +111,24 @@ fn find_server_binary() -> Option<PathBuf> {
                         let path = entry.path();
                         if path.is_file() {
                             if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                                if fname.starts_with("bbdb-server") {
+                                if is_valid_binary_name(fname) {
+                                    return Some(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check in exe_dir/resources/ (Tauri installer resource bundling)
+            let resources_sub = exe_dir.join("resources");
+            if resources_sub.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(resources_sub) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                                if is_valid_binary_name(fname) {
                                     return Some(path);
                                 }
                             }
@@ -49,7 +139,7 @@ fn find_server_binary() -> Option<PathBuf> {
         }
     }
 
-    // 2. AppImage APPDIR environment variable
+    // 2. AppImage APPDIR environment variable (Linux)
     if let Ok(appdir) = std::env::var("APPDIR") {
         let in_appdir = PathBuf::from(appdir).join("usr/bin/bbdb-server");
         if in_appdir.is_file() {
@@ -57,7 +147,7 @@ fn find_server_binary() -> Option<PathBuf> {
         }
     }
 
-    // 3. System installation paths
+    // 3. System installation paths (Linux / Unix)
     for p in &["/usr/bin/bbdb-server", "/usr/local/bin/bbdb-server"] {
         let path = PathBuf::from(p);
         if path.is_file() {
@@ -67,9 +157,15 @@ fn find_server_binary() -> Option<PathBuf> {
 
     // 4. Source tree workspace locations (useful during development / testing)
     let cwd_candidates = [
+        "src-tauri/binaries/bbdb-server-x86_64-pc-windows-msvc.exe",
+        "binaries/bbdb-server-x86_64-pc-windows-msvc.exe",
         "src-tauri/binaries/bbdb-server-x86_64-unknown-linux-gnu",
         "binaries/bbdb-server-x86_64-unknown-linux-gnu",
+        "src-tauri/binaries/bbdb-server-aarch64-apple-darwin",
+        "binaries/bbdb-server-aarch64-apple-darwin",
+        "src-tauri/target/release/bbdb-server.exe",
         "src-tauri/target/release/bbdb-server",
+        "src-tauri/target/debug/bbdb-server.exe",
         "src-tauri/target/debug/bbdb-server",
     ];
     for rel in &cwd_candidates {
@@ -79,14 +175,14 @@ fn find_server_binary() -> Option<PathBuf> {
         }
     }
 
-    // Also check if src-tauri/binaries has any bbdb-server*
+    // Also check if src-tauri/binaries or binaries has any bbdb-server*
     for dir in &["src-tauri/binaries", "binaries"] {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
                     if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                        if fname.starts_with("bbdb-server") {
+                        if fname.starts_with("bbdb-server") && !fname.ends_with(".d") && !fname.ends_with(".pdb") {
                             return Some(path);
                         }
                     }
@@ -111,24 +207,17 @@ fn ensure_backend_running() {
         }
     }
 
-    // Compute user data directory (~/.bbdb-manager)
-    let data_dir = std::env::var("HOME").ok().map(|h| {
-        let p = PathBuf::from(h).join(".bbdb-manager");
-        let _ = std::fs::create_dir_all(&p);
-        p
-    });
+    let data_dir = get_data_dir();
 
     let child = if let Some(server_bin) = find_server_binary() {
         eprintln!("[BBDB] Starting bundled backend server: {:?}", server_bin);
         let mut cmd = Command::new(server_bin);
         cmd.env("PORT", &port)
-            .env("NODE_ENV", "production");
-        if let Some(ref d) = data_dir {
-            cmd.env("BBDB_DATA_DIR", d);
-        }
-        cmd.stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
+            .env("HOST", "127.0.0.1")
+            .env("NODE_ENV", "production")
+            .env("BBDB_DATA_DIR", &data_dir);
+        apply_silent_spawn_options(&mut cmd, &data_dir);
+        cmd.spawn()
     } else {
         eprintln!("[BBDB] Bundled binary not found. Falling back to bun/node development server...");
         // Check bun in PATH or home
@@ -145,19 +234,18 @@ fn ensure_backend_running() {
 
         let mut bun_cmd = Command::new(&bun_path);
         bun_cmd.args(["run", "server.ts"])
-            .env("PORT", &port);
-        if let Some(ref d) = data_dir {
-            bun_cmd.env("BBDB_DATA_DIR", d);
-        }
-        bun_cmd.stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
+            .env("PORT", &port)
+            .env("HOST", "127.0.0.1")
+            .env("BBDB_DATA_DIR", &data_dir);
+        apply_silent_spawn_options(&mut bun_cmd, &data_dir);
+        bun_cmd.spawn()
             .or_else(|_| {
                 let mut node_cmd = Command::new("node");
-                node_cmd.args(["server.ts"]).env("PORT", &port);
-                if let Some(ref d) = data_dir {
-                    node_cmd.env("BBDB_DATA_DIR", d);
-                }
+                node_cmd.args(["server.ts"])
+                    .env("PORT", &port)
+                    .env("HOST", "127.0.0.1")
+                    .env("BBDB_DATA_DIR", &data_dir);
+                apply_silent_spawn_options(&mut node_cmd, &data_dir);
                 node_cmd.spawn()
             })
     };
@@ -203,6 +291,16 @@ pub fn run() {
     ensure_backend_running();
 
     tauri::Builder::default()
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Ok(mut lock) = BACKEND_PROCESS.lock() {
+                    if let Some(mut child) = lock.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 
@@ -210,6 +308,7 @@ pub fn run() {
     if let Ok(mut lock) = BACKEND_PROCESS.lock() {
         if let Some(mut child) = lock.take() {
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }

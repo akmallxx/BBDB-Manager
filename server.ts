@@ -93,6 +93,7 @@ function testTcpConnection(host: string, port: number, timeoutMs = 4000): Promis
 const app = express();
 const DEFAULT_BACKEND_PORT = 39001;
 const PORT = parseInt(process.env.PORT || process.env.VITE_BACKEND_PORT || process.env.BACKEND_PORT || String(DEFAULT_BACKEND_PORT), 10);
+const HOST = process.env.HOST || '127.0.0.1';
 const APP_NAME = process.env.VITE_APP_NAME || process.env.APP_NAME || 'BBDB Manager';
 
 app.use((req, res, next) => {
@@ -2116,8 +2117,8 @@ async function startServer() {
     return studioDb.prepare('SELECT * FROM connections WHERE id = ?').get(id) as Record<string, unknown> | undefined;
   });
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`${APP_NAME} server listening on http://0.0.0.0:${PORT}`);
+  httpServer.listen(PORT, HOST, () => {
+    console.log(`${APP_NAME} server listening on http://${HOST}:${PORT}`);
   });
 }
 
