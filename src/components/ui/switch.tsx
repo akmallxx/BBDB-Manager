@@ -8,6 +8,7 @@ export interface SwitchProps {
   size?: 'sm' | 'md';
   className?: string;
   id?: string;
+  'aria-label'?: string;
 }
 
 export function Switch({
@@ -16,7 +17,8 @@ export function Switch({
   disabled = false,
   size = 'md',
   className,
-  id
+  id,
+  'aria-label': ariaLabel
 }: SwitchProps) {
   const isSm = size === 'sm';
 
@@ -25,6 +27,7 @@ export function Switch({
       id={id}
       type="button"
       role="switch"
+      aria-label={ariaLabel}
       aria-checked={checked}
       disabled={disabled}
       onClick={() => !disabled && onCheckedChange(!checked)}
