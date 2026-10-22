@@ -15,15 +15,21 @@ import {
   Trash2,
   Edit2,
   Terminal,
-  ChevronRight,
   Eye,
   Save,
   X,
   AlertCircle,
   CheckCircle2,
-  Sliders,
   Home,
   Search,
+  ArrowRight,
+  ArrowLeft,
+  Monitor,
+  Server,
+  Columns,
+  Square,
+  CheckSquare,
+  ArrowRightLeft,
 } from 'lucide-react';
 import { Button } from '../ui/button';
 import { DatabaseConnection, SshConfigParams } from '../../types/database';
@@ -100,25 +106,39 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
   defaultShowHidden = false,
   onOpenSshTab,
 }) => {
+  // Dual-Pane toggle
+  const [isDualPane, setIsDualPane] = useState<boolean>(true);
+
+  // Remote SFTP State
   const [currentPath, setCurrentPath] = useState<string>(initialPath);
   const [pathInput, setPathInput] = useState<string>(initialPath);
   const [items, setItems] = useState<SftpFileItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [searchFilter, setSearchFilter] = useState<string>('');
+  const [selectedRemotePaths, setSelectedRemotePaths] = useState<Set<string>>(new Set());
+
+  // Local Filesystem State
+  const [localCurrentPath, setLocalCurrentPath] = useState<string>('');
+  const [localPathInput, setLocalPathInput] = useState<string>('');
+  const [localItems, setLocalItems] = useState<SftpFileItem[]>([]);
+  const [localLoading, setLocalLoading] = useState<boolean>(true);
+  const [localErrorMsg, setLocalErrorMsg] = useState<string | null>(null);
+  const [localSearchFilter, setLocalSearchFilter] = useState<string>('');
+  const [selectedLocalPaths, setSelectedLocalPaths] = useState<Set<string>>(new Set());
+
+  // Transfer & Drag State
+  const [isTransferring, setIsTransferring] = useState<boolean>(false);
+  const [dragOverTarget, setDragOverTarget] = useState<'local' | 'remote' | null>(null);
   const [showHidden, setShowHidden] = useState<boolean>(defaultShowHidden);
 
-  // Sync defaultShowHidden prop when changed externally in Settings
-  useEffect(() => {
-    setShowHidden(defaultShowHidden);
-  }, [defaultShowHidden]);
-
   // Modals state
-  const [editorFile, setEditorFile] = useState<{ path: string; name: string; content: string } | null>(null);
+  const [editorFile, setEditorFile] = useState<{ target: 'local' | 'remote'; path: string; name: string; content: string } | null>(null);
   const [editorLoading, setEditorLoading] = useState<boolean>(false);
   const [editorSaving, setEditorSaving] = useState<boolean>(false);
 
   const [promptModal, setPromptModal] = useState<{
+    target: 'local' | 'remote';
     type: 'mkdir' | 'touch' | 'rename' | 'chmod';
     title: string;
     value: string;
@@ -127,6 +147,11 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
 
   const [transferToast, setTransferToast] = useState<{ message: string; type: 'info' | 'success' | 'error' } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Sync defaultShowHidden prop when changed externally in Settings
+  useEffect(() => {
+    setShowHidden(defaultShowHidden);
+  }, [defaultShowHidden]);
 
   // Compute active SSH configuration
   const resolvedConfig = useMemo(() => {
@@ -155,6 +180,7 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
     setTimeout(() => setTransferToast(null), 4000);
   };
 
+  // --- Remote Directory Operations ---
   const loadDirectory = useCallback(async (targetPath: string) => {
     if (!connectionId && !resolvedConfig) {
       setLoading(false);
@@ -180,6 +206,7 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
         setItems(data.items);
         setCurrentPath(data.currentPath);
         setPathInput(data.currentPath);
+        setSelectedRemotePaths(new Set());
       } else {
         setErrorMsg(data.error || 'Failed to list directory');
       }
@@ -194,11 +221,43 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
     loadDirectory(initialPath);
   }, [loadDirectory, initialPath]);
 
-  const handleNavigate = (path: string) => {
+  // --- Local Directory Operations ---
+  const loadLocalDirectory = useCallback(async (targetPath?: string) => {
+    setLocalLoading(true);
+    setLocalErrorMsg(null);
+    try {
+      const res = await fetch('/api/local/list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: targetPath }),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.items) {
+        setLocalItems(data.items);
+        setLocalCurrentPath(data.currentPath);
+        setLocalPathInput(data.currentPath);
+        setSelectedLocalPaths(new Set());
+      } else {
+        setLocalErrorMsg(data.error || 'Failed to list local directory');
+      }
+    } catch (err: any) {
+      setLocalErrorMsg(err.message || 'Failed to load local directory');
+    } finally {
+      setLocalLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadLocalDirectory();
+  }, [loadLocalDirectory]);
+
+  // --- Navigations ---
+  const handleRemoteNavigate = (path: string) => {
     loadDirectory(path);
   };
 
-  const handleGoUp = () => {
+  const handleRemoteGoUp = () => {
     if (currentPath === '/' || currentPath === '') return;
     const parts = currentPath.split('/').filter(Boolean);
     parts.pop();
@@ -206,42 +265,139 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
     loadDirectory(parent);
   };
 
-  const handleOpenFile = async (item: SftpFileItem) => {
-    if (item.type === 'directory') {
-      handleNavigate(item.path);
+  const handleLocalNavigate = (path: string) => {
+    loadLocalDirectory(path);
+  };
+
+  const handleLocalGoUp = () => {
+    if (localCurrentPath === '/' || localCurrentPath === '') return;
+    const parts = localCurrentPath.split('/').filter(Boolean);
+    parts.pop();
+    const parent = '/' + parts.join('/');
+    loadLocalDirectory(parent || '/');
+  };
+
+  // --- Direct Streaming Transfers (Local <-> Remote) ---
+  const handleTransferToRemote = async (paths?: string[]) => {
+    const toTransfer = paths || Array.from(selectedLocalPaths);
+    if (toTransfer.length === 0) {
+      showToast('Select local file(s) or folder(s) to transfer', 'info');
       return;
     }
 
-    // Open file editor for text files
-    setEditorLoading(true);
-    setEditorFile({ path: item.path, name: item.name, content: '' });
+    setIsTransferring(true);
+    showToast(`Transferring ${toTransfer.length} item(s) to remote server...`, 'info');
+
     try {
-      const res = await fetch('/api/sftp/read', {
+      const res = await fetch('/api/sftp/transfer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          direction: 'to-remote',
+          sourcePaths: toTransfer,
+          targetDir: currentPath,
           connectionId,
           config: resolvedConfig,
-          path: item.path,
         }),
       });
+
       const data = await res.json();
-      if (res.ok) {
-        setEditorFile({ path: item.path, name: item.name, content: data.content });
+      if (res.ok && data.success) {
+        showToast(data.message || `Transferred ${toTransfer.length} item(s) to remote`, 'success');
+        setSelectedLocalPaths(new Set());
+        loadDirectory(currentPath);
       } else {
-        showToast(data.error || 'Failed to open file for editing', 'error');
-        setEditorFile(null);
+        showToast(data.error || (data.errors ? data.errors.join(', ') : 'Transfer to remote failed'), 'error');
+        loadDirectory(currentPath);
       }
     } catch (err: any) {
-      showToast(err.message || 'Failed to read file', 'error');
-      setEditorFile(null);
+      showToast(err.message || 'Transfer failed', 'error');
     } finally {
-      setEditorLoading(false);
+      setIsTransferring(false);
+    }
+  };
+
+  const handleTransferToLocal = async (paths?: string[]) => {
+    const toTransfer = paths || Array.from(selectedRemotePaths);
+    if (toTransfer.length === 0) {
+      showToast('Select remote file(s) or folder(s) to transfer', 'info');
+      return;
+    }
+
+    setIsTransferring(true);
+    showToast(`Transferring ${toTransfer.length} item(s) to local machine...`, 'info');
+
+    try {
+      const res = await fetch('/api/sftp/transfer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          direction: 'to-local',
+          sourcePaths: toTransfer,
+          targetDir: localCurrentPath,
+          connectionId,
+          config: resolvedConfig,
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.success) {
+        showToast(data.message || `Transferred ${toTransfer.length} item(s) to local`, 'success');
+        setSelectedRemotePaths(new Set());
+        loadLocalDirectory(localCurrentPath);
+      } else {
+        showToast(data.error || (data.errors ? data.errors.join(', ') : 'Transfer to local failed'), 'error');
+        loadLocalDirectory(localCurrentPath);
+      }
+    } catch (err: any) {
+      showToast(err.message || 'Transfer failed', 'error');
+    } finally {
+      setIsTransferring(false);
+    }
+  };
+
+  // --- File Editor ---
+  const handleOpenFile = async (item: SftpFileItem, target: 'local' | 'remote') => {
+    if (item.type === 'directory') {
+      if (target === 'remote') handleRemoteNavigate(item.path);
+      else handleLocalNavigate(item.path);
+      return;
+    }
+
+    if (target === 'remote') {
+      setEditorLoading(true);
+      setEditorFile({ target: 'remote', path: item.path, name: item.name, content: '' });
+      try {
+        const res = await fetch('/api/sftp/read', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            connectionId,
+            config: resolvedConfig,
+            path: item.path,
+          }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          setEditorFile({ target: 'remote', path: item.path, name: item.name, content: data.content });
+        } else {
+          showToast(data.error || 'Failed to open file for editing', 'error');
+          setEditorFile(null);
+        }
+      } catch (err: any) {
+        showToast(err.message || 'Failed to read file', 'error');
+        setEditorFile(null);
+      } finally {
+        setEditorLoading(false);
+      }
+    } else {
+      // Local file preview - simple notification or prompt
+      showToast(`Selected local file: ${item.name}`, 'info');
     }
   };
 
   const handleSaveEditor = async () => {
-    if (!editorFile) return;
+    if (!editorFile || editorFile.target !== 'remote') return;
     setEditorSaving(true);
     try {
       const res = await fetch('/api/sftp/write', {
@@ -269,19 +425,9 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
     }
   };
 
-  const handleDownload = (item: SftpFileItem) => {
-    showToast(`Downloading ${item.name}...`, 'info');
-    const url = `/api/sftp/download?connectionId=${encodeURIComponent(connectionId || '')}&path=${encodeURIComponent(item.path)}`;
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = item.name;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  };
-
-  const handleDelete = async (item: SftpFileItem) => {
-    if (!window.confirm(`Are you sure you want to permanently delete "${item.name}"?`)) return;
+  // --- Deletion & Management ---
+  const handleDeleteRemote = async (item: SftpFileItem) => {
+    if (!window.confirm(`Are you sure you want to permanently delete remote "${item.name}"?`)) return;
     try {
       const res = await fetch('/api/sftp/delete', {
         method: 'POST',
@@ -305,67 +451,120 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
     }
   };
 
+  const handleDeleteLocal = async (item: SftpFileItem) => {
+    if (!window.confirm(`Are you sure you want to delete local "${item.name}"?`)) return;
+    try {
+      const res = await fetch('/api/local/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: item.path }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(`Deleted ${item.name}`, 'success');
+        loadLocalDirectory(localCurrentPath);
+      } else {
+        showToast(data.error || 'Failed to delete local item', 'error');
+      }
+    } catch (err: any) {
+      showToast(err.message || 'Failed to delete local item', 'error');
+    }
+  };
+
+  // --- Prompt Modal (mkdir, rename, chmod, touch) ---
   const handlePromptSubmit = async () => {
     if (!promptModal || !promptModal.value.trim()) return;
-    const { type, value, targetItem } = promptModal;
+    const { target, type, value, targetItem } = promptModal;
     setPromptModal(null);
 
     try {
-      if (type === 'mkdir') {
-        const dest = currentPath.endsWith('/') ? `${currentPath}${value}` : `${currentPath}/${value}`;
-        const res = await fetch('/api/sftp/mkdir', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ connectionId, config: resolvedConfig, path: dest }),
-        });
-        const data = await res.json();
-        if (res.ok) {
-          showToast(`Created folder "${value}"`, 'success');
-          loadDirectory(currentPath);
-        } else showToast(data.error || 'Failed to create folder', 'error');
-      } else if (type === 'touch') {
-        const dest = currentPath.endsWith('/') ? `${currentPath}${value}` : `${currentPath}/${value}`;
-        const res = await fetch('/api/sftp/write', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ connectionId, config: resolvedConfig, path: dest, content: '' }),
-        });
-        const data = await res.json();
-        if (res.ok) {
-          showToast(`Created file "${value}"`, 'success');
-          loadDirectory(currentPath);
-        } else showToast(data.error || 'Failed to create file', 'error');
-      } else if (type === 'rename' && targetItem) {
-        const parts = targetItem.path.split('/');
-        parts.pop();
-        const newPath = [...parts, value].join('/');
-        const res = await fetch('/api/sftp/rename', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ connectionId, config: resolvedConfig, oldPath: targetItem.path, newPath }),
-        });
-        const data = await res.json();
-        if (res.ok) {
-          showToast(`Renamed to "${value}"`, 'success');
-          loadDirectory(currentPath);
-        } else showToast(data.error || 'Failed to rename item', 'error');
-      } else if (type === 'chmod' && targetItem) {
-        const res = await fetch('/api/sftp/chmod', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ connectionId, config: resolvedConfig, path: targetItem.path, mode: value }),
-        });
-        const data = await res.json();
-        if (res.ok) {
-          showToast(`Updated permissions for "${targetItem.name}"`, 'success');
-          loadDirectory(currentPath);
-        } else showToast(data.error || 'Failed to update permissions', 'error');
+      if (target === 'remote') {
+        if (type === 'mkdir') {
+          const dest = currentPath.endsWith('/') ? `${currentPath}${value}` : `${currentPath}/${value}`;
+          const res = await fetch('/api/sftp/mkdir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ connectionId, config: resolvedConfig, path: dest }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            showToast(`Created remote folder "${value}"`, 'success');
+            loadDirectory(currentPath);
+          } else showToast(data.error || 'Failed to create folder', 'error');
+        } else if (type === 'touch') {
+          const dest = currentPath.endsWith('/') ? `${currentPath}${value}` : `${currentPath}/${value}`;
+          const res = await fetch('/api/sftp/write', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ connectionId, config: resolvedConfig, path: dest, content: '' }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            showToast(`Created remote file "${value}"`, 'success');
+            loadDirectory(currentPath);
+          } else showToast(data.error || 'Failed to create file', 'error');
+        } else if (type === 'rename' && targetItem) {
+          const parts = targetItem.path.split('/');
+          parts.pop();
+          const newPath = [...parts, value].join('/');
+          const res = await fetch('/api/sftp/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ connectionId, config: resolvedConfig, oldPath: targetItem.path, newPath }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            showToast(`Renamed to "${value}"`, 'success');
+            loadDirectory(currentPath);
+          } else showToast(data.error || 'Failed to rename item', 'error');
+        } else if (type === 'chmod' && targetItem) {
+          const res = await fetch('/api/sftp/chmod', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ connectionId, config: resolvedConfig, path: targetItem.path, mode: value }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            showToast(`Updated permissions for "${targetItem.name}"`, 'success');
+            loadDirectory(currentPath);
+          } else showToast(data.error || 'Failed to update permissions', 'error');
+        }
+      } else {
+        // Target: local
+        if (type === 'mkdir') {
+          const dest = `${localCurrentPath}/${value}`;
+          const res = await fetch('/api/local/mkdir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: dest }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            showToast(`Created local folder "${value}"`, 'success');
+            loadLocalDirectory(localCurrentPath);
+          } else showToast(data.error || 'Failed to create local folder', 'error');
+        } else if (type === 'rename' && targetItem) {
+          const parts = targetItem.path.split('/');
+          parts.pop();
+          const newPath = [...parts, value].join('/');
+          const res = await fetch('/api/local/rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ oldPath: targetItem.path, newPath }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            showToast(`Renamed local item to "${value}"`, 'success');
+            loadLocalDirectory(localCurrentPath);
+          } else showToast(data.error || 'Failed to rename local item', 'error');
+        }
       }
     } catch (err: any) {
       showToast(err.message || 'Operation failed', 'error');
     }
   };
 
+  // --- Browser Upload Fallback (from browser file dialog) ---
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -401,316 +600,827 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
     loadDirectory(currentPath);
   };
 
-  // Filter items
-  const filteredItems = items.filter((item) => {
-    if (!showHidden && item.name.startsWith('.')) return false;
-    if (searchFilter && !item.name.toLowerCase().includes(searchFilter.toLowerCase())) return false;
-    return true;
-  });
+  // --- Filtering ---
+  const filteredRemoteItems = useMemo(() => {
+    return items.filter((item) => {
+      if (!showHidden && item.name.startsWith('.')) return false;
+      if (searchFilter && !item.name.toLowerCase().includes(searchFilter.toLowerCase())) return false;
+      return true;
+    });
+  }, [items, showHidden, searchFilter]);
+
+  const filteredLocalItems = useMemo(() => {
+    return localItems.filter((item) => {
+      if (!showHidden && item.name.startsWith('.')) return false;
+      if (localSearchFilter && !item.name.toLowerCase().includes(localSearchFilter.toLowerCase())) return false;
+      return true;
+    });
+  }, [localItems, showHidden, localSearchFilter]);
+
+  // Selection helpers
+  const toggleSelectLocal = (path: string) => {
+    setSelectedLocalPaths(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const toggleSelectAllLocal = () => {
+    if (selectedLocalPaths.size === filteredLocalItems.length && filteredLocalItems.length > 0) {
+      setSelectedLocalPaths(new Set());
+    } else {
+      setSelectedLocalPaths(new Set(filteredLocalItems.map(i => i.path)));
+    }
+  };
+
+  const toggleSelectRemote = (path: string) => {
+    setSelectedRemotePaths(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const toggleSelectAllRemote = () => {
+    if (selectedRemotePaths.size === filteredRemoteItems.length && filteredRemoteItems.length > 0) {
+      setSelectedRemotePaths(new Set());
+    } else {
+      setSelectedRemotePaths(new Set(filteredRemoteItems.map(i => i.path)));
+    }
+  };
 
   return (
     <div className="flex-1 flex flex-col h-full bg-zinc-950 overflow-hidden select-none">
-      {/* Top Toolbar */}
+      {/* Top Main Toolbar */}
       <div className="h-10 bg-zinc-900/90 border-b border-zinc-800 flex items-center justify-between px-3 select-none shrink-0 gap-2">
-        {/* Left: Host Info & Breadcrumb Bar */}
+        {/* Left: View Mode Toggle & Server Info */}
         <div className="flex items-center gap-2 flex-1 min-w-0">
-          <Folder className="w-4 h-4 text-sky-400 shrink-0" />
-          <span className="text-xs font-semibold text-zinc-300 shrink-0">{hostDisplay}</span>
+          <div className="flex items-center bg-zinc-950 border border-zinc-800 rounded p-0.5 shrink-0">
+            <button
+              onClick={() => setIsDualPane(true)}
+              className={cn(
+                'flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-colors',
+                isDualPane ? 'bg-zinc-800 text-yellow-400 font-semibold shadow-xs' : 'text-zinc-400 hover:text-zinc-200'
+              )}
+              title="Dual-Pane View: Local Machine & Remote Server Side-by-Side"
+            >
+              <Columns className="w-3.5 h-3.5" />
+              <span>Side-by-Side</span>
+            </button>
+            <button
+              onClick={() => setIsDualPane(false)}
+              className={cn(
+                'flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium transition-colors',
+                !isDualPane ? 'bg-zinc-800 text-yellow-400 font-semibold shadow-xs' : 'text-zinc-400 hover:text-zinc-200'
+              )}
+              title="Single-Pane View: Remote Server Only"
+            >
+              <Server className="w-3.5 h-3.5" />
+              <span>Remote Only</span>
+            </button>
+          </div>
 
           <div className="h-4 w-px bg-zinc-800 mx-1 shrink-0" />
 
-          {/* Nav Controls */}
-          <button
-            onClick={handleGoUp}
-            disabled={currentPath === '/' || currentPath === ''}
-            title="Go to Parent Directory"
-            className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-40 transition-colors shrink-0"
-          >
-            <ArrowUp className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => handleNavigate('.')}
-            title="Go to Home Directory (~)"
-            className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors shrink-0"
-          >
-            <Home className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => loadDirectory(currentPath)}
-            disabled={loading}
-            title="Refresh Directory"
-            className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-40 transition-colors shrink-0"
-          >
-            <RefreshCw className={cn('w-3.5 h-3.5', loading && 'animate-spin')} />
-          </button>
-
-          {/* Breadcrumb / Path Input */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleNavigate(pathInput);
-            }}
-            className="flex-1 flex items-center bg-zinc-950/80 border border-zinc-800 rounded px-2 py-0.5 min-w-[200px] max-w-xl text-xs"
-          >
-            <input
-              type="text"
-              value={pathInput}
-              onChange={(e) => setPathInput(e.target.value)}
-              placeholder="/remote/path"
-              className="w-full bg-transparent border-none text-zinc-200 outline-none font-mono text-[11px]"
-            />
-          </form>
+          {/* Connected Host Indicator */}
+          <div className="flex items-center gap-1.5 text-xs text-zinc-300 truncate">
+            <Server className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+            <span className="font-semibold truncate">{hostDisplay}</span>
+          </div>
         </div>
 
-        {/* Right: Actions (Upload, New Folder, New File, SSH Switch) */}
-        <div className="flex items-center gap-1 shrink-0">
-          {/* New Folder */}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setPromptModal({ type: 'mkdir', title: 'New Folder Name', value: 'new-folder' })}
-            className="h-7 text-xs gap-1 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800"
-            title="Create Directory"
+        {/* Right: Quick Global Actions */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {/* Refresh Both */}
+          <button
+            onClick={() => {
+              loadDirectory(currentPath);
+              if (isDualPane) loadLocalDirectory(localCurrentPath);
+            }}
+            disabled={loading || localLoading}
+            title="Refresh All Panes"
+            className="p-1.5 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors"
           >
-            <FolderPlus className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Folder</span>
-          </Button>
-
-          {/* New File */}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setPromptModal({ type: 'touch', title: 'New File Name', value: 'untitled.txt' })}
-            className="h-7 text-xs gap-1 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800"
-            title="Create Empty File"
-          >
-            <FilePlus className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">File</span>
-          </Button>
-
-          {/* Upload File */}
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={handleFileUpload}
-          />
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => fileInputRef.current?.click()}
-            className="h-7 text-xs gap-1 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800"
-            title="Upload Files to Remote Folder"
-          >
-            <Upload className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Upload</span>
-          </Button>
+            <RefreshCw className={cn('w-3.5 h-3.5', (loading || localLoading) && 'animate-spin')} />
+          </button>
 
           {/* Toggle Hidden Files */}
           <button
             onClick={() => setShowHidden(!showHidden)}
-            title={showHidden ? 'Hide dotfiles' : 'Show hidden dotfiles'}
+            title={showHidden ? 'Hide hidden dotfiles' : 'Show hidden dotfiles (.*)'}
             className={cn(
-              'p-1.5 rounded text-xs transition-colors',
-              showHidden ? 'bg-zinc-800 text-yellow-400 font-bold' : 'text-zinc-400 hover:text-zinc-200'
+              'px-2 py-1 rounded text-xs transition-colors border',
+              showHidden
+                ? 'bg-zinc-800 border-zinc-700 text-yellow-400 font-bold'
+                : 'bg-transparent border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800'
             )}
           >
             .*
           </button>
+
+          {/* Open SSH Terminal if callback provided */}
+          {onOpenSshTab && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onOpenSshTab(connectionId, resolvedConfig || undefined)}
+              className="h-7 text-xs gap-1 border-zinc-700 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800"
+              title="Open SSH Terminal for this server"
+            >
+              <Terminal className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden sm:inline">Terminal</span>
+            </Button>
+          )}
         </div>
       </div>
 
-      {/* Search & Filter Bar */}
-      <div className="h-8 bg-zinc-950/70 border-b border-zinc-800/80 flex items-center justify-between px-3 text-xs shrink-0">
-        <div className="flex items-center gap-2 flex-1">
-          <Search className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-          <input
-            type="text"
-            value={searchFilter}
-            onChange={(e) => setSearchFilter(e.target.value)}
-            placeholder="Filter files..."
-            className="bg-transparent border-none text-zinc-300 outline-none text-xs w-64 placeholder:text-zinc-600"
-          />
-        </div>
-        <div className="text-[11px] text-zinc-500">
-          {filteredItems.length} items {searchFilter ? `(filtered from ${items.length})` : ''}
-        </div>
-      </div>
+      {/* Main Panes Container */}
+      <div className="flex-1 flex flex-row w-full overflow-hidden relative">
+        {/* ================= LEFT PANE: LOCAL MACHINE ================= */}
+        {isDualPane && (
+          <div
+            className={cn(
+              'flex-1 flex flex-col h-full border-r border-zinc-800 bg-zinc-950/60 min-w-[280px] relative transition-colors',
+              dragOverTarget === 'local' && 'ring-2 ring-inset ring-sky-500/60 bg-sky-950/10'
+            )}
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = 'copy';
+              if (dragOverTarget !== 'local') setDragOverTarget('local');
+            }}
+            onDragLeave={() => setDragOverTarget(null)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOverTarget(null);
+              try {
+                const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+                if (data.source === 'remote' && Array.isArray(data.paths)) {
+                  handleTransferToLocal(data.paths);
+                }
+              } catch {
+                // Ignore invalid drag payload
+              }
+            }}
+          >
+            {/* Local Pane Header / Nav */}
+            <div className="h-9 bg-zinc-900/70 border-b border-zinc-800/90 flex items-center justify-between px-2.5 gap-2 shrink-0">
+              <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                <Monitor className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span className="text-[11px] font-semibold text-zinc-200 shrink-0">Local Machine</span>
 
-      {/* Main File Table Area */}
-      <div className="flex-1 w-full overflow-y-auto overflow-x-auto select-text relative">
-        {loading && (
-          <div className="absolute inset-0 bg-zinc-950/60 backdrop-blur-xs flex items-center justify-center z-10">
-            <div className="flex items-center gap-2 px-4 py-2 rounded bg-zinc-900 border border-zinc-800 text-xs text-zinc-300">
-              <RefreshCw className="w-4 h-4 animate-spin text-sky-400" />
-              <span>Loading remote files...</span>
+                <div className="h-3.5 w-px bg-zinc-800 mx-1 shrink-0" />
+
+                <button
+                  onClick={handleLocalGoUp}
+                  disabled={localCurrentPath === '/' || localCurrentPath === ''}
+                  title="Up Directory"
+                  className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-30 transition-colors shrink-0"
+                >
+                  <ArrowUp className="w-3 h-3" />
+                </button>
+                <button
+                  onClick={() => loadLocalDirectory()}
+                  title="User Home Directory"
+                  className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors shrink-0"
+                >
+                  <Home className="w-3 h-3" />
+                </button>
+                <button
+                  onClick={() => loadLocalDirectory(localCurrentPath)}
+                  disabled={localLoading}
+                  title="Refresh Local Files"
+                  className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-30 transition-colors shrink-0"
+                >
+                  <RefreshCw className={cn('w-3 h-3', localLoading && 'animate-spin')} />
+                </button>
+
+                {/* Local Path Input */}
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleLocalNavigate(localPathInput);
+                  }}
+                  className="flex-1 flex items-center bg-zinc-950 border border-zinc-800 rounded px-1.5 py-0.5 text-xs min-w-[80px]"
+                >
+                  <input
+                    type="text"
+                    value={localPathInput}
+                    onChange={(e) => setLocalPathInput(e.target.value)}
+                    placeholder="/local/path"
+                    className="w-full bg-transparent border-none text-zinc-200 outline-none font-mono text-[10px]"
+                  />
+                </form>
+              </div>
+
+              {/* Local Actions */}
+              <div className="flex items-center gap-1 shrink-0">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setPromptModal({ target: 'local', type: 'mkdir', title: 'New Local Folder', value: 'new-folder' })}
+                  className="h-6 px-1.5 text-[11px] gap-1 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800"
+                  title="Create Local Folder"
+                >
+                  <FolderPlus className="w-3 h-3 text-amber-400" />
+                </Button>
+              </div>
+            </div>
+
+            {/* Local Search & Counter Bar */}
+            <div className="h-7 bg-zinc-950/80 border-b border-zinc-800/60 flex items-center justify-between px-2.5 text-xs shrink-0">
+              <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                <Search className="w-3 h-3 text-zinc-500 shrink-0" />
+                <input
+                  type="text"
+                  value={localSearchFilter}
+                  onChange={(e) => setLocalSearchFilter(e.target.value)}
+                  placeholder="Filter local files..."
+                  className="bg-transparent border-none text-zinc-300 outline-none text-[11px] w-full placeholder:text-zinc-600"
+                />
+              </div>
+              <div className="text-[10px] text-zinc-500 shrink-0">
+                {selectedLocalPaths.size > 0 ? (
+                  <span className="text-yellow-400 font-semibold">{selectedLocalPaths.size} selected</span>
+                ) : (
+                  `${filteredLocalItems.length} items`
+                )}
+              </div>
+            </div>
+
+            {/* Local File Table */}
+            <div className="flex-1 w-full overflow-y-auto overflow-x-auto select-text relative">
+              {localLoading && (
+                <div className="absolute inset-0 bg-zinc-950/60 backdrop-blur-xs flex items-center justify-center z-10">
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded bg-zinc-900 border border-zinc-800 text-xs text-zinc-300">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                    <span>Loading local files...</span>
+                  </div>
+                </div>
+              )}
+
+              {localErrorMsg && (
+                <div className="m-3 p-3 rounded bg-rose-950/30 border border-rose-800/60 text-rose-300 text-xs flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-semibold">Local access error</div>
+                    <div className="font-mono text-[10px] text-zinc-400">{localErrorMsg}</div>
+                  </div>
+                </div>
+              )}
+
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-zinc-800/80 bg-zinc-900/40 text-zinc-400 text-[10px] font-medium sticky top-0 select-none">
+                    <th className="py-1.5 px-2 w-6 text-center">
+                      <button
+                        onClick={toggleSelectAllLocal}
+                        className="text-zinc-400 hover:text-zinc-100"
+                        title="Select All Local Files"
+                      >
+                        {selectedLocalPaths.size === filteredLocalItems.length && filteredLocalItems.length > 0 ? (
+                          <CheckSquare className="w-3.5 h-3.5 text-yellow-400" />
+                        ) : (
+                          <Square className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    </th>
+                    <th className="py-1.5 px-2">Name</th>
+                    <th className="py-1.5 px-2 w-20 text-right">Size</th>
+                    <th className="py-1.5 px-2 w-24 text-right">Modified</th>
+                    <th className="py-1.5 px-2 w-14 text-right">Transfer</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800/60">
+                  {localCurrentPath !== '/' && localCurrentPath !== '' && (
+                    <tr
+                      onClick={handleLocalGoUp}
+                      className="hover:bg-zinc-900/60 cursor-pointer text-zinc-400 group"
+                    >
+                      <td className="py-1 px-2 text-center text-zinc-600"></td>
+                      <td className="py-1 px-2 flex items-center gap-1.5">
+                        <Folder className="w-3.5 h-3.5 text-amber-500/80 shrink-0" />
+                        <span className="font-medium text-zinc-400 group-hover:text-zinc-200 font-mono text-[11px]">..</span>
+                      </td>
+                      <td className="py-1 px-2 text-right text-zinc-600 font-mono text-[10px]">--</td>
+                      <td className="py-1 px-2 text-right text-zinc-600 text-[10px]">--</td>
+                      <td className="py-1 px-2 text-right"></td>
+                    </tr>
+                  )}
+
+                  {filteredLocalItems.map((item) => {
+                    const isSelected = selectedLocalPaths.has(item.path);
+                    return (
+                      <tr
+                        key={item.path}
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData(
+                            'text/plain',
+                            JSON.stringify({
+                              source: 'local',
+                              paths: selectedLocalPaths.has(item.path)
+                                ? Array.from(selectedLocalPaths)
+                                : [item.path],
+                            })
+                          );
+                        }}
+                        onDoubleClick={() => handleOpenFile(item, 'local')}
+                        className={cn(
+                          'hover:bg-zinc-900/70 transition-colors group cursor-pointer text-zinc-300',
+                          isSelected && 'bg-yellow-950/20 text-yellow-200'
+                        )}
+                      >
+                        <td
+                          className="py-1 px-2 text-center"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleSelectLocal(item.path);
+                          }}
+                        >
+                          {isSelected ? (
+                            <CheckSquare className="w-3.5 h-3.5 text-yellow-400 inline" />
+                          ) : (
+                            <Square className="w-3.5 h-3.5 text-zinc-600 group-hover:text-zinc-400 inline" />
+                          )}
+                        </td>
+                        <td className="py-1 px-2 flex items-center gap-1.5 truncate">
+                          {getFileIcon(item)}
+                          <span
+                            onClick={() => handleOpenFile(item, 'local')}
+                            className={cn(
+                              'truncate text-[11px] hover:underline',
+                              item.type === 'directory' ? 'text-zinc-100 font-medium' : 'text-zinc-300'
+                            )}
+                          >
+                            {item.name}
+                          </span>
+                        </td>
+                        <td className="py-1 px-2 text-right text-zinc-400 font-mono text-[10px]">
+                          {item.type === 'directory' ? '--' : formatBytes(item.size)}
+                        </td>
+                        <td className="py-1 px-2 text-right text-zinc-400 text-[10px] truncate">
+                          {formatDate(item.mtime)}
+                        </td>
+                        <td className="py-1 px-2 text-right shrink-0">
+                          <div className="flex items-center justify-end gap-1">
+                            {/* Inline Transfer to Remote */}
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleTransferToRemote([item.path]);
+                              }}
+                              disabled={isTransferring}
+                              title="Transfer to Remote Server (➔)"
+                              className="p-1 rounded text-zinc-400 hover:text-sky-400 hover:bg-zinc-800 transition-colors"
+                            >
+                              <ArrowRight className="w-3 h-3" />
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDeleteLocal(item);
+                              }}
+                              title="Delete local file"
+                              className="p-1 rounded text-zinc-500 hover:text-rose-400 hover:bg-zinc-800 transition-colors opacity-0 group-hover:opacity-100"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+
+                  {!localLoading && filteredLocalItems.length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="py-8 text-center text-zinc-500 text-xs">
+                        This local directory is empty
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         )}
 
-        {errorMsg && (
-          <div className="m-4 p-4 rounded-lg bg-rose-950/30 border border-rose-800/60 text-rose-300 text-xs flex items-start gap-3">
-            <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
-            <div>
-              <div className="font-semibold mb-1">Failed to list directory</div>
-              <div className="font-mono text-zinc-400">{errorMsg}</div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => loadDirectory(currentPath)}
-                className="mt-3 h-7 text-xs border-rose-800 text-rose-200 hover:bg-rose-950"
+        {/* ================= CENTER ACTION STRIP (TRANSFER CONTROLS) ================= */}
+        {isDualPane && (
+          <div className="w-11 bg-zinc-900 border-r border-zinc-800 flex flex-col items-center justify-center py-4 gap-3 shrink-0 select-none shadow-xs z-10">
+            {/* Transfer Local -> Remote */}
+            <button
+              onClick={() => handleTransferToRemote()}
+              disabled={isTransferring || selectedLocalPaths.size === 0}
+              title={
+                selectedLocalPaths.size > 0
+                  ? `Transfer ${selectedLocalPaths.size} selected item(s) to Remote Server (➔)`
+                  : 'Select local item(s) then click to transfer to Remote'
+              }
+              className={cn(
+                'w-8 h-8 rounded-lg flex items-center justify-center transition-all shadow-sm',
+                selectedLocalPaths.size > 0
+                  ? 'bg-sky-500 text-white hover:bg-sky-400 shadow-sky-500/20 active:scale-95'
+                  : 'bg-zinc-800 text-zinc-500 hover:text-zinc-300 disabled:opacity-40'
+              )}
+            >
+              <ArrowRight className="w-4 h-4" />
+            </button>
+
+            {/* Indicator */}
+            <div className="text-[9px] text-zinc-500 font-mono tracking-tighter">
+              {isTransferring ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-yellow-400" />
+              ) : (
+                <ArrowRightLeft className="w-3.5 h-3.5 text-zinc-600" />
+              )}
+            </div>
+
+            {/* Transfer Remote -> Local */}
+            <button
+              onClick={() => handleTransferToLocal()}
+              disabled={isTransferring || selectedRemotePaths.size === 0}
+              title={
+                selectedRemotePaths.size > 0
+                  ? `Transfer ${selectedRemotePaths.size} selected item(s) to Local Machine (⬅)`
+                  : 'Select remote item(s) then click to transfer to Local'
+              }
+              className={cn(
+                'w-8 h-8 rounded-lg flex items-center justify-center transition-all shadow-sm',
+                selectedRemotePaths.size > 0
+                  ? 'bg-emerald-500 text-white hover:bg-emerald-400 shadow-emerald-500/20 active:scale-95'
+                  : 'bg-zinc-800 text-zinc-500 hover:text-zinc-300 disabled:opacity-40'
+              )}
+            >
+              <ArrowLeft className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* ================= RIGHT PANE: REMOTE SERVER ================= */}
+        <div
+          className={cn(
+            'flex-1 flex flex-col h-full bg-zinc-950 min-w-[280px] relative transition-colors',
+            dragOverTarget === 'remote' && 'ring-2 ring-inset ring-sky-500/60 bg-sky-950/10'
+          )}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+            if (dragOverTarget !== 'remote') setDragOverTarget('remote');
+          }}
+          onDragLeave={() => setDragOverTarget(null)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOverTarget(null);
+            try {
+              const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+              if (data.source === 'local' && Array.isArray(data.paths)) {
+                handleTransferToRemote(data.paths);
+              }
+            } catch {
+              // Ignore invalid drag payload
+            }
+          }}
+        >
+          {/* Remote Pane Header / Nav */}
+          <div className="h-9 bg-zinc-900/70 border-b border-zinc-800/90 flex items-center justify-between px-2.5 gap-2 shrink-0">
+            <div className="flex items-center gap-1.5 min-w-0 flex-1">
+              <Server className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+              <span className="text-[11px] font-semibold text-zinc-200 shrink-0">Remote Server</span>
+
+              <div className="h-3.5 w-px bg-zinc-800 mx-1 shrink-0" />
+
+              <button
+                onClick={handleRemoteGoUp}
+                disabled={currentPath === '/' || currentPath === ''}
+                title="Up Directory"
+                className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-30 transition-colors shrink-0"
               >
-                Retry
+                <ArrowUp className="w-3 h-3" />
+              </button>
+              <button
+                onClick={() => handleRemoteNavigate('.')}
+                title="Remote Home Directory (~)"
+                className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors shrink-0"
+              >
+                <Home className="w-3 h-3" />
+              </button>
+              <button
+                onClick={() => loadDirectory(currentPath)}
+                disabled={loading}
+                title="Refresh Remote Files"
+                className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-30 transition-colors shrink-0"
+              >
+                <RefreshCw className={cn('w-3 h-3', loading && 'animate-spin')} />
+              </button>
+
+              {/* Remote Path Input */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleRemoteNavigate(pathInput);
+                }}
+                className="flex-1 flex items-center bg-zinc-950 border border-zinc-800 rounded px-1.5 py-0.5 text-xs min-w-[80px]"
+              >
+                <input
+                  type="text"
+                  value={pathInput}
+                  onChange={(e) => setPathInput(e.target.value)}
+                  placeholder="/remote/path"
+                  className="w-full bg-transparent border-none text-zinc-200 outline-none font-mono text-[10px]"
+                />
+              </form>
+            </div>
+
+            {/* Remote Actions */}
+            <div className="flex items-center gap-1 shrink-0">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setPromptModal({ target: 'remote', type: 'mkdir', title: 'New Remote Folder', value: 'new-folder' })}
+                className="h-6 px-1.5 text-[11px] gap-1 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800"
+                title="Create Remote Directory"
+              >
+                <FolderPlus className="w-3 h-3 text-amber-400" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setPromptModal({ target: 'remote', type: 'touch', title: 'New Remote File', value: 'untitled.txt' })}
+                className="h-6 px-1.5 text-[11px] gap-1 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800"
+                title="Create Remote File"
+              >
+                <FilePlus className="w-3 h-3 text-purple-400" />
+              </Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={handleFileUpload}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                className="h-6 px-1.5 text-[11px] gap-1 text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800"
+                title="Upload Files from Computer Dialog"
+              >
+                <Upload className="w-3 h-3 text-sky-400" />
               </Button>
             </div>
           </div>
-        )}
 
-        <table className="w-full text-left text-xs border-collapse">
-          <thead>
-            <tr className="border-b border-zinc-800/80 bg-zinc-900/40 text-zinc-400 text-[11px] font-medium sticky top-0 select-none">
-              <th className="py-2 px-3">Name</th>
-              <th className="py-2 px-3 w-28">Size</th>
-              <th className="py-2 px-3 w-32 font-mono">Permissions</th>
-              <th className="py-2 px-3 w-40">Modified</th>
-              <th className="py-2 px-3 w-28 text-right">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-zinc-800">
-            {currentPath !== '/' && currentPath !== '' && (
-              <tr
-                onClick={handleGoUp}
-                className="hover:bg-zinc-900/60 cursor-pointer text-zinc-400 group"
-              >
-                <td className="py-1.5 px-3 flex items-center gap-2">
-                  <Folder className="w-4 h-4 text-amber-500/80 shrink-0" />
-                  <span className="font-medium text-zinc-400 group-hover:text-zinc-200 font-mono">..</span>
-                </td>
-                <td className="py-1.5 px-3 text-zinc-600 font-mono">--</td>
-                <td className="py-1.5 px-3 text-zinc-600 font-mono">drwxr-xr-x</td>
-                <td className="py-1.5 px-3 text-zinc-600">--</td>
-                <td className="py-1.5 px-3 text-right"></td>
-              </tr>
+          {/* Remote Search & Counter Bar */}
+          <div className="h-7 bg-zinc-950/80 border-b border-zinc-800/60 flex items-center justify-between px-2.5 text-xs shrink-0">
+            <div className="flex items-center gap-1.5 flex-1 min-w-0">
+              <Search className="w-3 h-3 text-zinc-500 shrink-0" />
+              <input
+                type="text"
+                value={searchFilter}
+                onChange={(e) => setSearchFilter(e.target.value)}
+                placeholder="Filter remote files..."
+                className="bg-transparent border-none text-zinc-300 outline-none text-[11px] w-full placeholder:text-zinc-600"
+              />
+            </div>
+            <div className="text-[10px] text-zinc-500 shrink-0">
+              {selectedRemotePaths.size > 0 ? (
+                <span className="text-yellow-400 font-semibold">{selectedRemotePaths.size} selected</span>
+              ) : (
+                `${filteredRemoteItems.length} items`
+              )}
+            </div>
+          </div>
+
+          {/* Remote File Table */}
+          <div className="flex-1 w-full overflow-y-auto overflow-x-auto select-text relative">
+            {loading && (
+              <div className="absolute inset-0 bg-zinc-950/60 backdrop-blur-xs flex items-center justify-center z-10">
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded bg-zinc-900 border border-zinc-800 text-xs text-zinc-300">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
+                  <span>Loading remote files...</span>
+                </div>
+              </div>
             )}
 
-            {filteredItems.map((item) => (
-              <tr
-                key={item.path}
-                onDoubleClick={() => handleOpenFile(item)}
-                className="hover:bg-zinc-900/70 transition-colors group cursor-pointer text-zinc-300"
-              >
-                <td className="py-1.5 px-3 flex items-center gap-2 truncate">
-                  {getFileIcon(item)}
-                  <span
-                    onClick={() => handleOpenFile(item)}
-                    className={cn(
-                      'truncate hover:underline',
-                      item.type === 'directory' ? 'text-zinc-100 font-medium' : 'text-zinc-300'
-                    )}
+            {errorMsg && (
+              <div className="m-3 p-3 rounded bg-rose-950/30 border border-rose-800/60 text-rose-300 text-xs flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-semibold">Remote directory error</div>
+                  <div className="font-mono text-[10px] text-zinc-400">{errorMsg}</div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => loadDirectory(currentPath)}
+                    className="mt-2 h-6 text-[11px] border-rose-800 text-rose-200 hover:bg-rose-950"
                   >
-                    {item.name}
-                  </span>
-                </td>
-                <td className="py-1.5 px-3 text-zinc-400 font-mono text-[11px]">
-                  {item.type === 'directory' ? '--' : formatBytes(item.size)}
-                </td>
-                <td
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setPromptModal({
-                      type: 'chmod',
-                      title: `Change Permissions: ${item.name}`,
-                      value: (item.mode & 0o777).toString(8),
-                      targetItem: item,
-                    });
-                  }}
-                  title="Click to modify chmod permissions"
-                  className="py-1.5 px-3 font-mono text-zinc-400 hover:text-yellow-400 hover:underline cursor-pointer text-[11px]"
-                >
-                  {item.permissions}
-                </td>
-                <td className="py-1.5 px-3 text-zinc-400 text-[11px] truncate">
-                  {formatDate(item.mtime)}
-                </td>
-                <td className="py-1.5 px-3 text-right shrink-0">
-                  <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    {item.type === 'file' && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleOpenFile(item);
-                        }}
-                        title="Edit / View File"
-                        className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors"
-                      >
-                        <Eye className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                    {item.type === 'file' && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleDownload(item);
-                        }}
-                        title="Download File"
-                        className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setPromptModal({
-                          type: 'rename',
-                          title: `Rename "${item.name}"`,
-                          value: item.name,
-                          targetItem: item,
-                        });
-                      }}
-                      title="Rename"
-                      className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors"
-                    >
-                      <Edit2 className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDelete(item);
-                      }}
-                      title="Delete"
-                      className="p-1 rounded text-zinc-400 hover:text-rose-400 hover:bg-zinc-800 transition-colors"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-
-            {!loading && filteredItems.length === 0 && (
-              <tr>
-                <td colSpan={5} className="py-8 text-center text-zinc-500">
-                  This directory is empty
-                </td>
-              </tr>
+                    Retry
+                  </Button>
+                </div>
+              </div>
             )}
-          </tbody>
-        </table>
+
+            <table className="w-full text-left text-xs border-collapse">
+              <thead>
+                <tr className="border-b border-zinc-800/80 bg-zinc-900/40 text-zinc-400 text-[10px] font-medium sticky top-0 select-none">
+                  <th className="py-1.5 px-2 w-6 text-center">
+                    <button
+                      onClick={toggleSelectAllRemote}
+                      className="text-zinc-400 hover:text-zinc-100"
+                      title="Select All Remote Files"
+                    >
+                      {selectedRemotePaths.size === filteredRemoteItems.length && filteredRemoteItems.length > 0 ? (
+                        <CheckSquare className="w-3.5 h-3.5 text-yellow-400" />
+                      ) : (
+                        <Square className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  </th>
+                  <th className="py-1.5 px-2">Name</th>
+                  <th className="py-1.5 px-2 w-20 text-right">Size</th>
+                  <th className="py-1.5 px-2 w-24 font-mono text-center">Permissions</th>
+                  <th className="py-1.5 px-2 w-28 text-right">Modified</th>
+                  <th className="py-1.5 px-2 w-20 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800/60">
+                {currentPath !== '/' && currentPath !== '' && (
+                  <tr
+                    onClick={handleRemoteGoUp}
+                    className="hover:bg-zinc-900/60 cursor-pointer text-zinc-400 group"
+                  >
+                    <td className="py-1 px-2 text-center text-zinc-600"></td>
+                    <td className="py-1 px-2 flex items-center gap-1.5">
+                      <Folder className="w-3.5 h-3.5 text-amber-500/80 shrink-0" />
+                      <span className="font-medium text-zinc-400 group-hover:text-zinc-200 font-mono text-[11px]">..</span>
+                    </td>
+                    <td className="py-1 px-2 text-right text-zinc-600 font-mono text-[10px]">--</td>
+                    <td className="py-1 px-2 text-center text-zinc-600 font-mono text-[10px]">drwxr-xr-x</td>
+                    <td className="py-1 px-2 text-right text-zinc-600 text-[10px]">--</td>
+                    <td className="py-1 px-2 text-right"></td>
+                  </tr>
+                )}
+
+                {filteredRemoteItems.map((item) => {
+                  const isSelected = selectedRemotePaths.has(item.path);
+                  return (
+                    <tr
+                      key={item.path}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData(
+                          'text/plain',
+                          JSON.stringify({
+                            source: 'remote',
+                            paths: selectedRemotePaths.has(item.path)
+                              ? Array.from(selectedRemotePaths)
+                              : [item.path],
+                          })
+                        );
+                      }}
+                      onDoubleClick={() => handleOpenFile(item, 'remote')}
+                      className={cn(
+                        'hover:bg-zinc-900/70 transition-colors group cursor-pointer text-zinc-300',
+                        isSelected && 'bg-yellow-950/20 text-yellow-200'
+                      )}
+                    >
+                      <td
+                        className="py-1 px-2 text-center"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleSelectRemote(item.path);
+                        }}
+                      >
+                        {isSelected ? (
+                          <CheckSquare className="w-3.5 h-3.5 text-yellow-400 inline" />
+                        ) : (
+                          <Square className="w-3.5 h-3.5 text-zinc-600 group-hover:text-zinc-400 inline" />
+                        )}
+                      </td>
+                      <td className="py-1 px-2 flex items-center gap-1.5 truncate">
+                        {getFileIcon(item)}
+                        <span
+                          onClick={() => handleOpenFile(item, 'remote')}
+                          className={cn(
+                            'truncate text-[11px] hover:underline',
+                            item.type === 'directory' ? 'text-zinc-100 font-medium' : 'text-zinc-300'
+                          )}
+                        >
+                          {item.name}
+                        </span>
+                      </td>
+                      <td className="py-1 px-2 text-right text-zinc-400 font-mono text-[10px]">
+                        {item.type === 'directory' ? '--' : formatBytes(item.size)}
+                      </td>
+                      <td
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPromptModal({
+                            target: 'remote',
+                            type: 'chmod',
+                            title: `Change Permissions: ${item.name}`,
+                            value: (item.mode & 0o777).toString(8),
+                            targetItem: item,
+                          });
+                        }}
+                        title="Click to modify chmod permissions"
+                        className="py-1 px-2 text-center font-mono text-zinc-400 hover:text-yellow-400 hover:underline cursor-pointer text-[10px]"
+                      >
+                        {item.permissions}
+                      </td>
+                      <td className="py-1 px-2 text-right text-zinc-400 text-[10px] truncate">
+                        {formatDate(item.mtime)}
+                      </td>
+                      <td className="py-1 px-2 text-right shrink-0">
+                        <div className="flex items-center justify-end gap-0.5">
+                          {/* Inline Transfer to Local */}
+                          {isDualPane && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleTransferToLocal([item.path]);
+                              }}
+                              disabled={isTransferring}
+                              title="Transfer to Local Machine (⬅)"
+                              className="p-1 rounded text-zinc-400 hover:text-emerald-400 hover:bg-zinc-800 transition-colors"
+                            >
+                              <ArrowLeft className="w-3 h-3" />
+                            </button>
+                          )}
+
+                          {item.type === 'file' && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleOpenFile(item, 'remote');
+                              }}
+                              title="Edit / View File"
+                              className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors"
+                            >
+                              <Eye className="w-3 h-3" />
+                            </button>
+                          )}
+
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPromptModal({
+                                target: 'remote',
+                                type: 'rename',
+                                title: `Rename "${item.name}"`,
+                                value: item.name,
+                                targetItem: item,
+                              });
+                            }}
+                            title="Rename"
+                            className="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors opacity-0 group-hover:opacity-100"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteRemote(item);
+                            }}
+                            title="Delete"
+                            className="p-1 rounded text-zinc-400 hover:text-rose-400 hover:bg-zinc-800 transition-colors opacity-0 group-hover:opacity-100"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+
+                {!loading && filteredRemoteItems.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="py-8 text-center text-zinc-500 text-xs">
+                      This remote directory is empty
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
 
       {/* Toast Notification */}
       {transferToast && (
         <div className="absolute bottom-4 right-4 z-50 flex items-center gap-2 px-3 py-2 rounded-lg shadow-lg border text-xs bg-zinc-900 border-zinc-700 text-zinc-100 animate-in fade-in slide-in-from-bottom-2">
-          {transferToast.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-400" />}
-          {transferToast.type === 'error' && <AlertCircle className="w-4 h-4 text-rose-400" />}
-          {transferToast.type === 'info' && <RefreshCw className="w-4 h-4 text-sky-400 animate-spin" />}
+          {transferToast.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />}
+          {transferToast.type === 'error' && <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />}
+          {transferToast.type === 'info' && <RefreshCw className="w-4 h-4 text-sky-400 animate-spin shrink-0" />}
           <span>{transferToast.message}</span>
         </div>
       )}
 
-      {/* Simple Prompt Modal (New Folder / New File / Rename / Chmod) */}
+      {/* Modal: New Folder / New File / Rename / Chmod */}
       {promptModal && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="w-full max-w-sm rounded-lg bg-zinc-900 border border-zinc-800 shadow-xl p-4 flex flex-col gap-3">
