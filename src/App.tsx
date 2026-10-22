@@ -1,12 +1,17 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { DatabaseConnection, SchemaGroup, WorkspaceTab, QueryHistoryItem, ThemeConfig } from './types/database';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { DatabaseConnection, SchemaGroup, WorkspaceTab, QueryHistoryItem, ThemeConfig, SshConfigParams, ShortcutMap } from './types/database';
+import { DEFAULT_SHORTCUT_MAP, isShortcutMatch } from './lib/shortcuts';
 import { NavigationRail, RailView } from './components/NavigationRail';
 import { SidebarDrawer } from './components/SidebarDrawer';
 import { TabBar } from './components/TabBar';
 import { ConnectionView } from './components/ConnectionView';
 import { DataTableView } from './components/DataTableView';
 import { SqlEditorView } from './components/SqlEditorView';
+import { SshTerminalView } from './components/ssh/SshTerminalView';
+import { SftpExplorerView } from './components/sftp/SftpExplorerView';
 import { TransactionLogModal } from './components/TransactionLogModal';
+import { SnippetVariableModal, SnippetVariable } from './components/ssh/SnippetVariableModal';
+import { SettingsModal } from './components/SettingsModal';
 import { ToastProvider, useToast } from './components/ui/toast';
 import { APP_NAME } from './lib/config';
 import { cn } from './lib/utils';
@@ -81,16 +86,27 @@ function AppContent() {
     }
   }, [isSidebarOpen, railView, setSidebarOpenState]);
 
-  // Theme settings (persisted via JSON)
+  // Theme & App settings (persisted via SQLite)
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [autocommitDefault, setAutocommitDefault] = useState(true);
   const [autocommit, setAutocommit] = useState(true);
   const [inTransaction, setInTransaction] = useState(false);
   const [isTransactionLogOpen, setIsTransactionLogOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [appFontSize, setAppFontSize] = useState<number>(13);
+  const [defaultQueryLimit, setDefaultQueryLimit] = useState<number>(50);
+  const [confirmDestructiveQueries, setConfirmDestructiveQueries] = useState<boolean>(true);
+  const [terminalFontSize, setTerminalFontSize] = useState<number>(13);
+  const [terminalCursorStyle, setTerminalCursorStyle] = useState<'block' | 'underline' | 'bar'>('block');
+  const [sftpShowHidden, setSftpShowHidden] = useState<boolean>(false);
+  const [shortcuts, setShortcuts] = useState<ShortcutMap>({ ...DEFAULT_SHORTCUT_MAP });
 
   // Connections (persisted via SQLite)
   const [connections, setConnections] = useState<DatabaseConnection[]>([]);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | undefined>(undefined);
   const [activeConnection, setActiveConnection] = useState<DatabaseConnection | null>(null);
+  const activeConnectionRef = useRef<DatabaseConnection | null>(null);
+  activeConnectionRef.current = activeConnection;
 
   // Entities & Database Schemas
   const [activeDatabase, setActiveDatabase] = useState('');
@@ -101,28 +117,177 @@ function AppContent() {
   // Query History (persisted via SQLite)
   const [history, setHistory] = useState<QueryHistoryItem[]>([]);
 
-  // Workspace Tabs
   const [tabs, setTabs] = useState<WorkspaceTab[]>([
     {
       id: 'tab-conn-main',
       type: 'connection_form',
-      title: 'New Connection'
+      title: 'New Connection',
+      initialMode: 'database'
     }
   ]);
   const [activeTabId, setActiveTabId] = useState<string>('tab-conn-main');
   const [queryCounter, setQueryCounter] = useState(1);
 
-  // 1. Load Theme Config from JSON endpoint
+  // Snippet Template Variables Modal State
+  const [snippetModal, setSnippetModal] = useState<{
+    isOpen: boolean;
+    rawCommand: string;
+    variables: SnippetVariable[];
+    autoExecute: boolean;
+  }>({
+    isOpen: false,
+    rawCommand: '',
+    variables: [],
+    autoExecute: true,
+  });
+
+  // Context-aware Workspace Mode ('database' | 'ssh')
+  const [workspaceMode, setWorkspaceMode] = useState<'database' | 'ssh'>('database');
+
+  // Auto-sync workspaceMode with the active workspace tab
+  useEffect(() => {
+    const currentTab = tabs.find(t => t.id === activeTabId);
+    if (!currentTab) return;
+
+    if (currentTab.type === 'ssh_terminal' || currentTab.type === 'sftp_explorer') {
+      setWorkspaceMode('ssh');
+      if (railView === 'entities' || railView === 'history') {
+        setRailView('connections');
+      }
+    } else if (currentTab.type === 'table_data' || currentTab.type === 'query_editor') {
+      setWorkspaceMode('database');
+    } else if (currentTab.type === 'connection_form') {
+      if (currentTab.initialMode === 'ssh') {
+        setWorkspaceMode('ssh');
+        if (railView === 'entities' || railView === 'history') {
+          setRailView('connections');
+        }
+      } else if (currentTab.initialMode === 'database') {
+        setWorkspaceMode('database');
+      }
+    }
+  }, [activeTabId, tabs, railView]);
+
+  const handleWorkspaceModeChange = (mode: 'database' | 'ssh') => {
+    setWorkspaceMode(mode);
+    if (mode === 'ssh') {
+      if (railView === 'entities' || railView === 'history') {
+        setRailView('connections');
+      }
+
+      // 1. Check if an SSH tab already exists
+      const existingSshTab = tabs.find(t =>
+        t.type === 'ssh_terminal' ||
+        t.type === 'sftp_explorer' ||
+        (t.type === 'connection_form' && t.initialMode === 'ssh')
+      );
+
+      if (existingSshTab) {
+        setActiveTabId(existingSshTab.id);
+      } else {
+        const newTabId = `tab-conn-new-${Date.now()}`;
+        const newTab: WorkspaceTab = {
+          id: newTabId,
+          type: 'connection_form',
+          title: 'New SSH Server',
+          initialMode: 'ssh'
+        };
+        setTabs(prev => [...prev, newTab]);
+        setActiveTabId(newTabId);
+      }
+    } else {
+      // 2. Switching to Database mode
+      const existingDbTab = tabs.find(t =>
+        t.type === 'table_data' ||
+        t.type === 'query_editor' ||
+        (t.type === 'connection_form' && t.initialMode !== 'ssh')
+      );
+
+      if (existingDbTab) {
+        setActiveTabId(existingDbTab.id);
+        if (activeConnection && (existingDbTab.type === 'table_data' || existingDbTab.type === 'query_editor')) {
+          setRailView('entities');
+        }
+      } else if (activeConnection) {
+        setQueryCounter(prev => {
+          const nextCount = prev + 1;
+          const newTab: WorkspaceTab = {
+            id: `tab-query-${Date.now()}`,
+            type: 'query_editor',
+            title: `Query #${nextCount}`,
+            connectionId: activeConnection.id,
+            queryText: 'SELECT current_database(), now();'
+          };
+          setTabs(p => [...p, newTab]);
+          setActiveTabId(newTab.id);
+          return nextCount;
+        });
+        setRailView('entities');
+      } else {
+        const newTabId = `tab-conn-new-${Date.now()}`;
+        const newTab: WorkspaceTab = {
+          id: newTabId,
+          type: 'connection_form',
+          title: 'New Connection',
+          initialMode: 'database'
+        };
+        setTabs(prev => [...prev, newTab]);
+        setActiveTabId(newTabId);
+        setRailView('connections');
+      }
+    }
+  };
+
+  // 1. Load Settings (Theme, Autocommit, Fonts, Limits) from SQLite settings endpoint
   const loadTheme = useCallback(async () => {
     try {
-      const res = await fetch('/api/theme');
+      const res = await fetch('/api/settings');
       if (res.ok) {
-        const config: ThemeConfig = await res.json();
-        setTheme(config.theme || 'dark');
-        if (config.theme === 'light') {
+        const settings = await res.json();
+        const currentTheme = settings.theme || 'dark';
+        setTheme(currentTheme === 'light' ? 'light' : 'dark');
+        if (currentTheme === 'light') {
           document.documentElement.classList.remove('dark');
         } else {
           document.documentElement.classList.add('dark');
+        }
+
+        if (settings.fontSize) {
+          const fs = parseInt(settings.fontSize, 10) || 13;
+          setAppFontSize(fs);
+          document.documentElement.style.setProperty('--app-font-size', `${fs}px`);
+        }
+        if (settings.defaultQueryLimit) {
+          setDefaultQueryLimit(parseInt(settings.defaultQueryLimit, 10) || 50);
+        }
+        if (settings.confirmDestructiveQueries !== undefined) {
+          setConfirmDestructiveQueries(settings.confirmDestructiveQueries === 'true');
+        }
+        if (settings.terminalFontSize) {
+          setTerminalFontSize(parseInt(settings.terminalFontSize, 10) || 13);
+        }
+        if (settings.terminalCursorStyle) {
+          setTerminalCursorStyle(settings.terminalCursorStyle as any);
+        }
+        if (settings.sftpShowHidden !== undefined) {
+          setSftpShowHidden(settings.sftpShowHidden === 'true');
+        }
+
+        if (settings.autocommitDefault !== undefined) {
+          const isAuto = settings.autocommitDefault === 'true';
+          setAutocommitDefault(isAuto);
+          if (activeConnectionRef.current?.environment !== 'production') {
+            setAutocommit(isAuto);
+          }
+        }
+
+        if (settings.custom_shortcuts) {
+          try {
+            const parsed = typeof settings.custom_shortcuts === 'string' ? JSON.parse(settings.custom_shortcuts) : settings.custom_shortcuts;
+            setShortcuts(prev => ({ ...prev, ...parsed }));
+          } catch (err) {
+            console.warn('Failed to parse custom_shortcuts from SQLite:', err);
+          }
         }
       }
     } catch {
@@ -147,7 +312,7 @@ function AppContent() {
         body: JSON.stringify({ theme: nextTheme })
       });
     } catch {
-      console.warn('Failed to save theme to JSON server');
+      console.warn('Failed to save theme to SQLite settings');
     }
   };
 
@@ -216,7 +381,8 @@ function AppContent() {
     const newTab: WorkspaceTab = {
       id: 'tab-conn-main',
       type: 'connection_form',
-      title: 'New Connection'
+      title: 'New Connection',
+      initialMode: 'database'
     };
     setTabs([newTab]);
     setActiveTabId(newTab.id);
@@ -228,6 +394,10 @@ function AppContent() {
 
   // 6. Connect to a database
   const handleConnect = async (conn: DatabaseConnection) => {
+    if (conn.connection_mode === 'ssh' || conn.driver === 'ssh') {
+      handleOpenSshTab(conn.id);
+      return;
+    }
     setActiveConnection(conn);
     setSelectedConnectionId(conn.id);
     const defaultFallback = conn.driver === 'sqlite' ? 'main' : conn.driver === 'sqlserver' ? 'master' : conn.driver === 'mysql' ? '' : 'postgres';
@@ -245,7 +415,7 @@ function AppContent() {
         'Autocommit is disabled for production connections. All mutations require manual Commit and can be Rolled back.'
       );
     } else {
-      setAutocommit(true);
+      setAutocommit(autocommitDefault);
     }
 
     try {
@@ -421,6 +591,298 @@ function AppContent() {
     setRailView('entities');
   };
 
+  const handleOpenSshTab = useCallback((connId?: string, config?: SshConfigParams, forceNew?: boolean) => {
+    let targetConn = connId ? connections.find(c => c.id === connId) : undefined;
+    if (!targetConn && !config) {
+      if (activeConnection && (activeConnection.connection_mode === 'ssh' || activeConnection.driver === 'ssh' || activeConnection.ssh_enabled)) {
+        targetConn = activeConnection;
+      } else if (selectedConnectionId) {
+        targetConn = connections.find(c => c.id === selectedConnectionId && (c.connection_mode === 'ssh' || c.driver === 'ssh' || c.ssh_enabled));
+      }
+    }
+
+    if (!targetConn && !config) {
+      const existingTab = tabs.find(t => t.type === 'ssh_terminal');
+      if (existingTab) {
+        setWorkspaceMode('ssh');
+        setActiveTabId(existingTab.id);
+        return;
+      }
+
+      setWorkspaceMode('ssh');
+      setRailView('connections');
+      const newTabId = `tab-conn-new-${Date.now()}`;
+      const newTab: WorkspaceTab = {
+        id: newTabId,
+        type: 'connection_form',
+        title: 'New SSH Server',
+        initialMode: 'ssh'
+      };
+      setTabs(prev => [...prev, newTab]);
+      setActiveTabId(newTabId);
+      info('Select SSH Server', 'Please configure or select an SSH server connection to open SSH CLI.');
+      return;
+    }
+
+    const effectiveConnId = connId || targetConn?.id;
+
+    // Reuse existing SSH Terminal tab if forceNew is not requested
+    if (!forceNew) {
+      const existingTab = tabs.find(t =>
+        t.type === 'ssh_terminal' &&
+        (
+          (effectiveConnId && t.connectionId === effectiveConnId) ||
+          (config?.host && t.sshConfig?.host === config.host)
+        )
+      );
+      if (existingTab) {
+        setWorkspaceMode('ssh');
+        setActiveTabId(existingTab.id);
+        return;
+      }
+    }
+
+    const title = config?.host
+      ? `SSH: ${config.host}`
+      : targetConn
+      ? `SSH: ${targetConn.name}`
+      : 'SSH Terminal';
+
+    const newTabId = `tab-ssh-${Date.now()}`;
+    const newTab: WorkspaceTab = {
+      id: newTabId,
+      type: 'ssh_terminal',
+      title,
+      connectionId: effectiveConnId,
+      sshConfig: config,
+    };
+
+    setWorkspaceMode('ssh');
+    setTabs(prev => [...prev, newTab]);
+    setActiveTabId(newTab.id);
+  }, [connections, activeConnection, selectedConnectionId, tabs, info]);
+
+  const handleOpenSftpTab = useCallback((connId?: string, config?: SshConfigParams, initialPath = '.', forceNew?: boolean) => {
+    let targetConn = connId ? connections.find(c => c.id === connId) : undefined;
+    if (!targetConn && !config) {
+      if (activeConnection && (activeConnection.connection_mode === 'ssh' || activeConnection.driver === 'ssh' || activeConnection.ssh_enabled)) {
+        targetConn = activeConnection;
+      } else if (selectedConnectionId) {
+        targetConn = connections.find(c => c.id === selectedConnectionId && (c.connection_mode === 'ssh' || c.driver === 'ssh' || c.ssh_enabled));
+      }
+    }
+
+    if (!targetConn && !config) {
+      const existingTab = tabs.find(t => t.type === 'sftp_explorer');
+      if (existingTab) {
+        setWorkspaceMode('ssh');
+        setActiveTabId(existingTab.id);
+        return;
+      }
+
+      setWorkspaceMode('ssh');
+      setRailView('connections');
+      const newTabId = `tab-conn-new-${Date.now()}`;
+      const newTab: WorkspaceTab = {
+        id: newTabId,
+        type: 'connection_form',
+        title: 'New SSH Server',
+        initialMode: 'ssh'
+      };
+      setTabs(prev => [...prev, newTab]);
+      setActiveTabId(newTabId);
+      info('Select SSH Server', 'Please configure or select an SSH server connection to open SFTP Explorer.');
+      return;
+    }
+
+    const effectiveConnId = connId || targetConn?.id;
+
+    // Reuse existing SFTP tab if forceNew is not requested
+    if (!forceNew) {
+      const existingTab = tabs.find(t =>
+        t.type === 'sftp_explorer' &&
+        (
+          (effectiveConnId && t.connectionId === effectiveConnId) ||
+          (config?.host && t.sshConfig?.host === config.host)
+        )
+      );
+      if (existingTab) {
+        setWorkspaceMode('ssh');
+        setActiveTabId(existingTab.id);
+        return;
+      }
+    }
+
+    const title = config?.host
+      ? `SFTP: ${config.host}`
+      : targetConn
+      ? `SFTP: ${targetConn.name}`
+      : 'SFTP Explorer';
+
+    const newTabId = `tab-sftp-${Date.now()}`;
+    const newTab: WorkspaceTab = {
+      id: newTabId,
+      type: 'sftp_explorer',
+      title,
+      connectionId: effectiveConnId,
+      sshConfig: config,
+      initialPath,
+    };
+
+    setWorkspaceMode('ssh');
+    setTabs(prev => [...prev, newTab]);
+    setActiveTabId(newTab.id);
+  }, [connections, activeConnection, selectedConnectionId, tabs, info]);
+
+  const handleNewTerminalTab = useCallback(() => {
+    const currentTab = tabs.find(t => t.id === activeTabIdRef.current);
+    const connId = currentTab?.connectionId;
+    const sshConfig = currentTab?.sshConfig;
+    handleOpenSshTab(connId, sshConfig, true);
+  }, [tabs, handleOpenSshTab]);
+
+  const handleDisconnectSsh = useCallback(() => {
+    const currentTab = tabs.find(t => t.id === activeTabIdRef.current);
+    const targetConnId = currentTab?.connectionId;
+    setTabs(prev => {
+      const remaining = prev.filter(t => {
+        if (targetConnId) {
+          return !(t.connectionId === targetConnId && (t.type === 'ssh_terminal' || t.type === 'sftp_explorer'));
+        }
+        return !(t.type === 'ssh_terminal' || t.type === 'sftp_explorer');
+      });
+
+      const remainingSshTabs = remaining.filter(t =>
+        t.type === 'ssh_terminal' ||
+        t.type === 'sftp_explorer' ||
+        (t.type === 'connection_form' && t.initialMode === 'ssh')
+      );
+
+      if (remainingSshTabs.length > 0) {
+        setActiveTabId(remainingSshTabs[remainingSshTabs.length - 1].id);
+        return remaining;
+      }
+
+      const newTabId = `tab-conn-new-${Date.now()}`;
+      const newSshTab: WorkspaceTab = {
+        id: newTabId,
+        type: 'connection_form',
+        title: 'New SSH Server',
+        initialMode: 'ssh'
+      };
+      setActiveTabId(newTabId);
+      return [...remaining, newSshTab];
+    });
+    setWorkspaceMode('ssh');
+    setRailView('connections');
+    setSidebarOpenState(true);
+    success('SSH Disconnected', 'Closed SSH session.');
+  }, [tabs, success, setSidebarOpenState]);
+
+  // Find active tab object
+  const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
+  const activeSelectedConnection = connections.find(c => c.id === selectedConnectionId);
+
+  const activeSshConnection = useMemo(() => {
+    // Only consider active if the current active tab is an active SSH terminal or SFTP explorer
+    if (activeTab.type !== 'ssh_terminal' && activeTab.type !== 'sftp_explorer') {
+      return null;
+    }
+    if (activeTab.connectionId) {
+      const conn = connections.find(c => c.id === activeTab.connectionId);
+      if (conn && (conn.connection_mode === 'ssh' || conn.driver === 'ssh' || conn.ssh_enabled)) {
+        return conn;
+      }
+    }
+    if (activeConnection && (activeConnection.connection_mode === 'ssh' || activeConnection.driver === 'ssh' || activeConnection.ssh_enabled)) {
+      return activeConnection;
+    }
+    if (selectedConnectionId) {
+      const conn = connections.find(c => c.id === selectedConnectionId);
+      if (conn && (conn.connection_mode === 'ssh' || conn.driver === 'ssh' || conn.ssh_enabled)) {
+        return conn;
+      }
+    }
+    return null;
+  }, [activeTab, activeConnection, selectedConnectionId, connections]);
+
+  const parseSnippetVariables = (cmd: string): SnippetVariable[] => {
+    const regex = /\{\{([a-zA-Z0-9_-]+(?::[^}]+)?)\}\}/g;
+    const matches: SnippetVariable[] = [];
+    const seen = new Set<string>();
+    let m;
+    while ((m = regex.exec(cmd)) !== null) {
+      const raw = m[1];
+      if (!seen.has(raw)) {
+        seen.add(raw);
+        if (raw.includes(':')) {
+          const [key, ...rest] = raw.split(':');
+          matches.push({ raw, key: key.trim(), defaultValue: rest.join(':').trim() });
+        } else {
+          matches.push({ raw, key: raw.trim(), defaultValue: '' });
+        }
+      }
+    }
+    return matches;
+  };
+
+  const dispatchSnippetToTerminal = useCallback((command: string, autoExecute: boolean) => {
+    const currentActiveTab = tabs.find(t => t.id === activeTabIdRef.current);
+    // 1. If active tab is already an SSH terminal, send to it directly
+    if (currentActiveTab?.type === 'ssh_terminal') {
+      window.dispatchEvent(
+        new CustomEvent('bbdb:run-snippet', {
+          detail: { tabId: currentActiveTab.id, command, autoExecute }
+        })
+      );
+      return;
+    }
+
+    // 2. If another SSH terminal tab is open, activate it and send
+    const existingTerminalTab = tabs.find(t => t.type === 'ssh_terminal');
+    if (existingTerminalTab) {
+      setWorkspaceMode('ssh');
+      setActiveTabId(existingTerminalTab.id);
+      setTimeout(() => {
+        window.dispatchEvent(
+          new CustomEvent('bbdb:run-snippet', {
+            detail: { tabId: existingTerminalTab.id, command, autoExecute }
+          })
+        );
+      }, 100);
+      return;
+    }
+
+    // 3. Otherwise, check for active or saved SSH host to open terminal
+    const sshTarget = activeSshConnection || connections.find(c => c.connection_mode === 'ssh' || c.driver === 'ssh' || c.ssh_enabled);
+    if (sshTarget) {
+      handleOpenSshTab(sshTarget.id);
+      setTimeout(() => {
+        window.dispatchEvent(
+          new CustomEvent('bbdb:run-snippet', {
+            detail: { command, autoExecute }
+          })
+        );
+      }, 1200);
+    } else {
+      info('No SSH Connection', 'Please configure or connect to an SSH server to run terminal snippets.');
+    }
+  }, [tabs, activeSshConnection, connections, handleOpenSshTab, info]);
+
+  const handleRunSnippet = useCallback((command: string, autoExecute: boolean) => {
+    const vars = parseSnippetVariables(command);
+    if (vars.length > 0) {
+      setSnippetModal({
+        isOpen: true,
+        rawCommand: command,
+        variables: vars,
+        autoExecute
+      });
+    } else {
+      dispatchSnippetToTerminal(command, autoExecute);
+    }
+  }, [dispatchSnippetToTerminal]);
+
   const activeTabIdRef = useRef(activeTabId);
   useEffect(() => {
     activeTabIdRef.current = activeTabId;
@@ -430,19 +892,77 @@ function AppContent() {
     setTabs(prevTabs => {
       if (prevTabs.length <= 1) return prevTabs;
       const nextTabs = prevTabs.filter(t => t.id !== id);
-      setActiveTabId(prevActiveId => {
-        if (prevActiveId === id) {
-          const nextActiveTab = nextTabs[nextTabs.length - 1];
-          if (nextActiveTab?.type === 'table_data' && activeConnection) {
-            setRailView('entities');
-          }
-          return nextActiveTab.id;
+
+      if (workspaceMode === 'ssh') {
+        const remainingSshTabs = nextTabs.filter(t =>
+          t.type === 'ssh_terminal' ||
+          t.type === 'sftp_explorer' ||
+          (t.type === 'connection_form' && t.initialMode === 'ssh')
+        );
+
+        if (remainingSshTabs.length === 0) {
+          // If no SSH tabs left in SSH mode, create a New SSH Server tab
+          const newTabId = `tab-conn-new-${Date.now()}`;
+          const newSshTab: WorkspaceTab = {
+            id: newTabId,
+            type: 'connection_form',
+            title: 'New SSH Server',
+            initialMode: 'ssh'
+          };
+          setActiveTabId(newTabId);
+          setRailView('connections');
+          setSidebarOpenState(true);
+          return [...nextTabs, newSshTab];
         }
-        return prevActiveId;
-      });
+
+        if (activeTabIdRef.current === id) {
+          const nextActiveTab = remainingSshTabs[remainingSshTabs.length - 1];
+          setActiveTabId(nextActiveTab.id);
+          if (nextActiveTab.type === 'connection_form') {
+            setRailView('connections');
+            setSidebarOpenState(true);
+          }
+        }
+        return nextTabs;
+      }
+
+      // Database mode logic:
+      const remainingDbTabs = nextTabs.filter(t =>
+        t.type === 'table_data' ||
+        t.type === 'query_editor' ||
+        (t.type === 'connection_form' && t.initialMode !== 'ssh')
+      );
+
+      if (remainingDbTabs.length === 0) {
+        // If no DB tabs left in DB mode, create a New Connection tab
+        const newTabId = `tab-conn-new-${Date.now()}`;
+        const newDbTab: WorkspaceTab = {
+          id: newTabId,
+          type: 'connection_form',
+          title: 'New Connection',
+          initialMode: 'database'
+        };
+        setActiveTabId(newTabId);
+        setRailView('connections');
+        setSidebarOpenState(true);
+        return [...nextTabs, newDbTab];
+      }
+
+      if (activeTabIdRef.current === id) {
+        const nextActiveTab = remainingDbTabs[remainingDbTabs.length - 1];
+        setActiveTabId(nextActiveTab.id);
+        if (nextActiveTab?.type === 'table_data' && activeConnection) {
+          setRailView('entities');
+          setSidebarOpenState(true);
+        } else if (nextActiveTab?.type === 'connection_form') {
+          setRailView('connections');
+          setSidebarOpenState(true);
+        }
+      }
+
       return nextTabs;
     });
-  }, [activeConnection]);
+  }, [activeConnection, workspaceMode, setSidebarOpenState]);
 
   // Tab Selection with automatic entities redirection when selecting a table tab
   const handleSelectTab = useCallback((tabId: string) => {
@@ -450,6 +970,12 @@ function AppContent() {
     const target = tabs.find(t => t.id === tabId);
     if (target?.type === 'table_data' && activeConnection) {
       setRailView('entities');
+      setSidebarOpenState(true);
+    } else if (target?.type === 'ssh_terminal' || target?.type === 'sftp_explorer') {
+      setWorkspaceMode('ssh');
+    } else if (target?.type === 'connection_form' && target.initialMode === 'ssh') {
+      setWorkspaceMode('ssh');
+      setRailView('connections');
       setSidebarOpenState(true);
     }
   }, [tabs, activeConnection, setSidebarOpenState]);
@@ -497,50 +1023,8 @@ function AppContent() {
     }
   }, []);
 
-  // Global Keyboard Shortcuts:
-  // 1. Ctrl + Shift + Q: Disconnect
-  // 2. Alt + T / Ctrl + Alt + T / Ctrl + Shift + N: New Query Tab (no browser clash)
-  // 3. Ctrl + W / Cmd + W / Alt + W / Ctrl + Shift + W: Close Active Tab
-  // 4. Ctrl + B / Cmd + B: Toggle Sidebar Visibility
-  useEffect(() => {
-    const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'b' || e.code === 'KeyB')) {
-        e.preventDefault();
-        toggleSidebar();
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key.toLowerCase() === 'q' || e.code === 'KeyQ')) {
-        e.preventDefault();
-        handleDisconnect();
-        return;
-      }
-      if (
-        ((e.ctrlKey || e.metaKey) && e.altKey && (e.key.toLowerCase() === 't' || e.code === 'KeyT')) ||
-        (e.altKey && (e.key.toLowerCase() === 't' || e.code === 'KeyT')) ||
-        ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key.toLowerCase() === 'n' || e.code === 'KeyN'))
-      ) {
-        e.preventDefault();
-        handleNewQueryTab();
-        return;
-      }
-      if (
-        ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'w' || e.code === 'KeyW')) ||
-        (e.altKey && (e.key.toLowerCase() === 'w' || e.code === 'KeyW')) ||
-        ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key.toLowerCase() === 'w' || e.code === 'KeyW'))
-      ) {
-        e.preventDefault();
-        if (activeTabIdRef.current) {
-          handleCloseTab(activeTabIdRef.current);
-        }
-        return;
-      }
-    };
-    window.addEventListener('keydown', handleGlobalKeyDown);
-    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
-  }, [handleDisconnect, handleNewQueryTab, handleCloseTab, toggleSidebar]);
-
   // Manual Commit / Autocommit Controls
-  const handleToggleAutocommit = () => {
+  const handleToggleAutocommit = useCallback(() => {
     if (activeConnection?.environment === 'production' && !autocommit) {
       const confirmed = window.confirm(
         '⚠️ PRODUCTION WARNING:\n\nThis connection is marked as PRODUCTION. Enabling Autocommit means all SQL mutations (UPDATE/DELETE/INSERT) will be immediately written to the database without the ability to rollback.\n\nAre you sure you want to enable Autocommit?'
@@ -553,7 +1037,81 @@ function AppContent() {
       next ? 'Autocommit Enabled' : 'Manual Commit Enabled',
       next ? 'Mutations will commit immediately' : 'Transactions must be committed manually with the Commit button'
     );
-  };
+  }, [activeConnection, autocommit, info]);
+
+  // Global Keyboard Shortcuts (Configurable via Studio Settings)
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      // Guard 1: Do not intercept shortcuts when a modal is active
+      if (isSettingsOpen || snippetModal.isOpen || isTransactionLogOpen) {
+        return;
+      }
+
+      // Guard 2: Do not intercept keystrokes when interactive terminal (xterm) has focus
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('.xterm')) {
+        return;
+      }
+
+      // 1. Toggle Sidebar (default Ctrl+B)
+      if (isShortcutMatch(e, shortcuts.toggle_sidebar || 'Ctrl+B')) {
+        e.preventDefault();
+        toggleSidebar();
+        return;
+      }
+      // 2. Open Settings (default Ctrl+,)
+      if (isShortcutMatch(e, shortcuts.open_settings || 'Ctrl+,')) {
+        e.preventDefault();
+        setIsSettingsOpen(prev => !prev);
+        return;
+      }
+      // 3. Disconnect Active Session (default Ctrl+Shift+Q)
+      if (isShortcutMatch(e, shortcuts.disconnect || 'Ctrl+Shift+Q')) {
+        e.preventDefault();
+        handleDisconnect();
+        return;
+      }
+      // 4. New Query Tab (default Alt+T)
+      if (isShortcutMatch(e, shortcuts.new_query || 'Alt+T')) {
+        e.preventDefault();
+        handleNewQueryTab();
+        return;
+      }
+      // 5. New Terminal Tab (default Alt+S)
+      if (isShortcutMatch(e, shortcuts.new_terminal || 'Alt+S')) {
+        e.preventDefault();
+        handleNewTerminalTab();
+        return;
+      }
+      // 6. Close Active Tab (default Ctrl+W)
+      if (isShortcutMatch(e, shortcuts.close_tab || 'Ctrl+W')) {
+        e.preventDefault();
+        if (activeTabIdRef.current) {
+          handleCloseTab(activeTabIdRef.current);
+        }
+        return;
+      }
+      // 7. Toggle Autocommit (default Ctrl+Shift+A)
+      if (isShortcutMatch(e, shortcuts.toggle_autocommit || 'Ctrl+Shift+A')) {
+        e.preventDefault();
+        handleToggleAutocommit();
+        return;
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [
+    shortcuts,
+    isSettingsOpen,
+    snippetModal.isOpen,
+    isTransactionLogOpen,
+    handleDisconnect, 
+    handleNewQueryTab, 
+    handleNewTerminalTab, 
+    handleCloseTab, 
+    toggleSidebar, 
+    handleToggleAutocommit
+  ]);
 
   const handleCommit = async () => {
     if (!activeConnection) return;
@@ -617,10 +1175,6 @@ function AppContent() {
     }
   };
 
-  // Find active tab object
-  const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
-  const activeSelectedConnection = connections.find(c => c.id === selectedConnectionId);
-
   return (
     <div
       className={cn(
@@ -635,12 +1189,18 @@ function AppContent() {
         isSidebarOpen={isSidebarOpen}
         onViewChange={handleRailViewChange}
         onNewQuery={() => handleNewQueryTab()}
+        onOpenSsh={() => handleOpenSshTab()}
+        onOpenSftp={() => handleOpenSftpTab()}
         theme={theme}
         onToggleTheme={toggleTheme}
+        onOpenSettings={() => setIsSettingsOpen(true)}
         activeConnectionName={activeConnection?.name}
         activeConnectionColor={activeConnection?.color}
         hasActiveConnection={Boolean(activeConnection)}
         onDisconnect={handleDisconnect}
+        workspaceMode={workspaceMode}
+        onWorkspaceModeChange={handleWorkspaceModeChange}
+        activeTabType={activeTab.type}
       />
 
       {/* 2. Sidebar Drawer (Connections list, Entities tree, or History) */}
@@ -649,12 +1209,18 @@ function AppContent() {
           <SidebarDrawer
             width={sidebarWidth}
             currentView={railView}
+            workspaceMode={workspaceMode}
+            onWorkspaceModeChange={handleWorkspaceModeChange}
+            activeTabType={activeTab.type}
+            activeSshConnection={activeSshConnection}
+            onDisconnectSsh={handleDisconnectSsh}
             connections={connections}
             activeConnectionId={activeConnection?.id}
             selectedConnectionId={selectedConnectionId}
             onSelectConnection={(id) => {
               setSelectedConnectionId(id);
               const connToEdit = connections.find(c => c.id === id);
+              const isSsh = connToEdit?.connection_mode === 'ssh' || connToEdit?.driver === 'ssh';
               const editTabId = `tab-conn-edit-${id}`;
               const existingEditTab = tabs.find(t => t.id === editTabId || (t.type === 'connection_form' && t.connectionId === id));
               if (existingEditTab) {
@@ -664,7 +1230,8 @@ function AppContent() {
                   id: editTabId,
                   type: 'connection_form',
                   title: connToEdit ? `Edit: ${connToEdit.name}` : 'Edit Connection',
-                  connectionId: id
+                  connectionId: id,
+                  initialMode: isSsh ? 'ssh' : 'database'
                 };
                 setTabs(prev => [...prev, editTab]);
                 setActiveTabId(editTabId);
@@ -672,26 +1239,25 @@ function AppContent() {
               setRailView('connections');
             }}
             onConnectConnection={handleConnect}
-            onNewConnectionClick={() => {
+            onNewConnectionClick={(mode = 'database') => {
               setSelectedConnectionId(undefined);
-              const existingNewTab = tabs.find(t => t.type === 'connection_form' && !t.connectionId);
-              if (existingNewTab) {
-                setActiveTabId(existingNewTab.id);
-              } else {
-                const newTabId = `tab-conn-new-${Date.now()}`;
-                const newTab: WorkspaceTab = {
-                  id: newTabId,
-                  type: 'connection_form',
-                  title: 'New Connection'
-                };
-                setTabs(prev => [...prev, newTab]);
-                setActiveTabId(newTabId);
-              }
+              const isSsh = mode === 'ssh';
+              const newTabId = `tab-conn-new-${Date.now()}`;
+              const newTab: WorkspaceTab = {
+                id: newTabId,
+                type: 'connection_form',
+                title: isSsh ? 'New SSH Server' : 'New Connection',
+                initialMode: isSsh ? 'ssh' : 'database'
+              };
+              setTabs(prev => [...prev, newTab]);
+              setActiveTabId(newTabId);
               setRailView('connections');
             }}
             onDeleteConnection={handleDeleteConnection}
             onDuplicateConnection={handleDuplicateConnection}
             onDisconnect={handleDisconnect}
+            onOpenSsh={handleOpenSshTab}
+            onOpenSftp={handleOpenSftpTab}
             activeDatabase={activeDatabase}
             databasesList={databasesList}
             onChangeDatabase={handleChangeDatabase}
@@ -705,6 +1271,7 @@ function AppContent() {
             onClearHistory={handleClearHistory}
             onSelectHistoryItem={(q) => handleNewQueryTab(q)}
             onOpenQueryTab={(q) => handleNewQueryTab(q)}
+            onViewChange={handleRailViewChange}
           />
 
           {/* Resizer Splitter Handle */}
@@ -731,6 +1298,9 @@ function AppContent() {
           onSelectTab={handleSelectTab}
           onCloseTab={handleCloseTab}
           onNewQueryTab={() => handleNewQueryTab()}
+          onNewTerminalTab={handleNewTerminalTab}
+          workspaceMode={workspaceMode}
+          activeTabType={activeTab.type}
           autocommit={autocommit}
           onToggleAutocommit={handleToggleAutocommit}
           inTransaction={inTransaction}
@@ -743,77 +1313,127 @@ function AppContent() {
           onDisconnect={handleDisconnect}
         />
 
-        {/* Tab Content Rendering */}
-        <div className="flex-1 flex flex-col h-full min-h-0 overflow-hidden">
-          {activeTab.type === 'connection_form' && (
-            <ConnectionView
-              key={activeTab.id + (activeTab.connectionId ? `_${activeTab.connectionId}` : '_new')}
-              initialConnection={activeTab.connectionId ? connections.find(c => c.id === activeTab.connectionId) || null : null}
-              onConnect={handleConnect}
-              onSave={handleSaveConnection}
-            />
-          )}
-
-          {activeTab.type === 'table_data' && activeConnection && (
-            <DataTableView
-              connection={activeConnection}
-              connectionId={activeConnection.id}
-              database={activeDatabase}
-              schemaName={activeTab.schemaName || 'public'}
-              tableName={activeTab.tableName || ''}
-              autocommit={autocommit}
-              inTransaction={inTransaction}
-              onTransactionChange={setInTransaction}
-              onRefreshHistory={loadHistory}
-              onDisconnect={handleDisconnect}
-              onOpenQueryTab={(q) => handleNewQueryTab(q)}
-            />
-          )}
-
-          {activeTab.type === 'query_editor' && activeConnection && (
-            <SqlEditorView
-              connection={activeConnection}
-              initialQuery={activeTab.queryText}
-              connectionId={activeConnection.id}
-              database={activeDatabase}
-              schemas={schemas}
-              autocommit={autocommit}
-              inTransaction={inTransaction}
-              onCommit={handleCommit}
-              onRollback={handleRollback}
-              onRefreshHistory={loadHistory}
-              onTransactionChange={setInTransaction}
-              onDisconnect={handleDisconnect}
-            />
-          )}
-
-          {activeTab.type !== 'connection_form' && !activeConnection && (
-            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-zinc-500">
-              <p className="text-sm font-medium text-zinc-300 mb-2">No Active Database Connection</p>
-              <p className="text-xs max-w-sm mb-4">Select a saved connection from the left panel or configure a new connection to open this workspace.</p>
-              <button
-                onClick={() => {
-                  const existingNewTab = tabs.find(t => t.type === 'connection_form' && !t.connectionId);
-                  if (existingNewTab) {
-                    setActiveTabId(existingNewTab.id);
-                  } else {
-                    const newTabId = `tab-conn-new-${Date.now()}`;
-                    const newTab: WorkspaceTab = {
-                      id: newTabId,
-                      type: 'connection_form',
-                      title: 'New Connection'
-                    };
-                    setTabs(prev => [...prev, newTab]);
-                    setActiveTabId(newTabId);
-                  }
-                  setRailView('connections');
-                }}
-                className="px-4 py-2 bg-yellow-400 text-zinc-950 text-xs font-semibold rounded hover:bg-yellow-300 transition-colors cursor-pointer"
+        {/* Tab Content Rendering - Keep-alive mounted containers to prevent reconnecting on tab switch */}
+        <div className="flex-1 flex flex-col h-full min-h-0 overflow-hidden relative">
+          {tabs.map((tab) => {
+            const isTabActive = tab.id === activeTabId;
+            return (
+              <div
+                key={tab.id}
+                className={cn(
+                  "w-full h-full flex-1 flex flex-col min-h-0",
+                  isTabActive ? "flex" : "hidden"
+                )}
               >
-                Go to Connection Settings
-              </button>
-            </div>
-          )}
+                {tab.type === 'connection_form' && (
+                  <ConnectionView
+                    initialConnection={tab.connectionId ? connections.find(c => c.id === tab.connectionId) || null : null}
+                    initialMode={tab.initialMode || (workspaceMode === 'ssh' ? 'ssh' : 'database')}
+                    onConnect={handleConnect}
+                    onSave={handleSaveConnection}
+                    onOpenSsh={(cfg) => handleOpenSshTab(undefined, cfg)}
+                    onOpenSftp={(cfg) => handleOpenSftpTab(undefined, cfg)}
+                  />
+                )}
+
+                {tab.type === 'table_data' && activeConnection && (
+                  <DataTableView
+                    connection={activeConnection}
+                    connectionId={activeConnection.id}
+                    database={activeDatabase}
+                    schemaName={tab.schemaName || 'public'}
+                    tableName={tab.tableName || ''}
+                    autocommit={autocommit}
+                    inTransaction={inTransaction}
+                    fontSize={appFontSize}
+                    defaultQueryLimit={defaultQueryLimit}
+                    onTransactionChange={setInTransaction}
+                    onRefreshHistory={loadHistory}
+                    onDisconnect={handleDisconnect}
+                    onOpenQueryTab={(q) => handleNewQueryTab(q)}
+                  />
+                )}
+
+                {tab.type === 'query_editor' && activeConnection && (
+                  <SqlEditorView
+                    connection={activeConnection}
+                    initialQuery={tab.queryText}
+                    connectionId={activeConnection.id}
+                    database={activeDatabase}
+                    schemas={schemas}
+                    autocommit={autocommit}
+                    inTransaction={inTransaction}
+                    fontSize={appFontSize}
+                    confirmDestructive={confirmDestructiveQueries}
+                    runQueryShortcut={shortcuts.run_query || 'Ctrl+Enter'}
+                    onCommit={handleCommit}
+                    onRollback={handleRollback}
+                    onRefreshHistory={loadHistory}
+                    onTransactionChange={setInTransaction}
+                    onDisconnect={handleDisconnect}
+                  />
+                )}
+
+                {tab.type === 'ssh_terminal' && (
+                  <SshTerminalView
+                    tabId={tab.id}
+                    isActive={isTabActive}
+                    connectionId={tab.connectionId}
+                    connection={tab.connectionId ? connections.find(c => c.id === tab.connectionId) || activeConnection : activeConnection}
+                    sshConfig={tab.sshConfig}
+                    theme={theme}
+                    terminalFontSize={terminalFontSize}
+                    terminalCursorStyle={terminalCursorStyle}
+                    onOpenSftpTab={handleOpenSftpTab}
+                    onRunSnippet={handleRunSnippet}
+                  />
+                )}
+
+                {tab.type === 'sftp_explorer' && (
+                  <SftpExplorerView
+                    tabId={tab.id}
+                    isActive={isTabActive}
+                    connectionId={tab.connectionId}
+                    connection={tab.connectionId ? connections.find(c => c.id === tab.connectionId) || activeConnection : activeConnection}
+                    sshConfig={tab.sshConfig}
+                    initialPath={tab.initialPath || '.'}
+                    defaultShowHidden={sftpShowHidden}
+                    onOpenSshTab={handleOpenSshTab}
+                  />
+                )}
+
+                {tab.type !== 'connection_form' && tab.type !== 'ssh_terminal' && tab.type !== 'sftp_explorer' && !activeConnection && (
+                  <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-zinc-500">
+                    <p className="text-sm font-medium text-zinc-300 mb-2">No Active Database Connection</p>
+                    <p className="text-xs max-w-sm mb-4">Select a saved connection from the left panel or configure a new connection to open this workspace.</p>
+                    <button
+                      onClick={() => {
+                        const existingNewTab = tabs.find(t => t.type === 'connection_form' && !t.connectionId);
+                        if (existingNewTab) {
+                          setActiveTabId(existingNewTab.id);
+                        } else {
+                          const newTabId = `tab-conn-new-${Date.now()}`;
+                          const isSsh = workspaceMode === 'ssh';
+                          const newTab: WorkspaceTab = {
+                            id: newTabId,
+                            type: 'connection_form',
+                            title: isSsh ? 'New SSH Server' : 'New Connection',
+                            initialMode: isSsh ? 'ssh' : 'database'
+                          };
+                          setTabs(prev => [...prev, newTab]);
+                          setActiveTabId(newTabId);
+                        }
+                        setRailView('connections');
+                      }}
+                      className="px-4 py-2 bg-yellow-400 text-slate-950 font-bold text-xs rounded hover:bg-yellow-300 transition-colors cursor-pointer"
+                    >
+                      Go to Connection Settings
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -827,6 +1447,44 @@ function AppContent() {
         onCommit={handleCommit}
         onRollback={handleRollback}
         isProduction={activeConnection?.environment === 'production'}
+      />
+
+      {/* Snippet Template Variable Input Modal */}
+      <SnippetVariableModal
+        isOpen={snippetModal.isOpen}
+        rawCommand={snippetModal.rawCommand}
+        variables={snippetModal.variables}
+        autoExecute={snippetModal.autoExecute}
+        onClose={() => setSnippetModal(prev => ({ ...prev, isOpen: false }))}
+        onSubmit={(resolvedCommand, autoExecute) => {
+          dispatchSnippetToTerminal(resolvedCommand, autoExecute);
+        }}
+      />
+
+      {/* Studio Settings & Preferences Modal */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        currentTheme={theme}
+        onThemeChange={(newTheme) => {
+          setTheme(newTheme);
+          if (newTheme === 'dark') {
+            document.documentElement.classList.add('dark');
+          } else {
+            document.documentElement.classList.remove('dark');
+          }
+        }}
+        currentAutocommit={autocommitDefault}
+        onAutocommitChange={(val) => {
+          setAutocommitDefault(val);
+          if (activeConnectionRef.current?.environment !== 'production') {
+            setAutocommit(val);
+          }
+        }}
+        onSettingsUpdated={async () => {
+          await loadTheme();
+        }}
+        onClearHistory={loadHistory}
       />
     </div>
   );

@@ -5,6 +5,7 @@ import { QueryExecutionResult, SchemaGroup, DatabaseConnection, TableSummary } f
 import { cn, triggerDownload, formatRelativeTime } from '../lib/utils';
 import { useToast } from './ui/toast';
 import { ConnectionFooter } from './ConnectionFooter';
+import { isShortcutMatch } from '../lib/shortcuts';
 
 interface SqlEditorViewProps {
   initialQuery?: string;
@@ -14,6 +15,9 @@ interface SqlEditorViewProps {
   schemas: SchemaGroup[];
   autocommit: boolean;
   inTransaction: boolean;
+  fontSize?: number;
+  confirmDestructive?: boolean;
+  runQueryShortcut?: string;
   onCommit: () => void;
   onRollback: () => void;
   onQueryChange?: (newQuery: string) => void;
@@ -63,19 +67,19 @@ function highlightSql(text: string): React.ReactNode {
     if (token.startsWith('--') || token.startsWith('/*')) {
       elements.push(<span key={keyIdx} className="text-zinc-500 italic">{token}</span>);
     } else if (token.startsWith("'")) {
-      elements.push(<span key={keyIdx} className="text-emerald-400 font-mono">{token}</span>);
+      elements.push(<span key={keyIdx} className="text-emerald-700 dark:text-emerald-400 font-mono">{token}</span>);
     } else if (/^\d+(\.\d+)?$/.test(token)) {
-      elements.push(<span key={keyIdx} className="text-amber-400 font-mono">{token}</span>);
+      elements.push(<span key={keyIdx} className="text-amber-700 dark:text-amber-400 font-mono">{token}</span>);
     } else {
       const upper = token.toUpperCase();
       if (SQL_KW_SET.has(upper)) {
-        elements.push(<span key={keyIdx} className="text-cyan-400 font-semibold">{token}</span>);
+        elements.push(<span key={keyIdx} className="text-blue-700 dark:text-cyan-400 font-semibold">{token}</span>);
       } else if (SQL_FN_SET.has(upper)) {
-        elements.push(<span key={keyIdx} className="text-amber-300 font-medium">{token}</span>);
+        elements.push(<span key={keyIdx} className="text-purple-700 dark:text-amber-300 font-medium">{token}</span>);
       } else if (/^[<>=!+\-*/%:]+$/.test(token)) {
-        elements.push(<span key={keyIdx} className="text-zinc-400">{token}</span>);
+        elements.push(<span key={keyIdx} className="text-slate-600 dark:text-zinc-400">{token}</span>);
       } else {
-        elements.push(<span key={keyIdx} className="text-zinc-200">{token}</span>);
+        elements.push(<span key={keyIdx} className="text-slate-900 dark:text-zinc-100">{token}</span>);
       }
     }
   }
@@ -135,6 +139,9 @@ export function SqlEditorView({
   schemas,
   autocommit,
   inTransaction,
+  fontSize = 13,
+  confirmDestructive = true,
+  runQueryShortcut = 'Ctrl+Enter',
   onCommit,
   onRollback,
   onQueryChange,
@@ -475,6 +482,27 @@ export function SqlEditorView({
       return;
     }
 
+    // Guard against destructive queries if confirmation is enabled
+    if (confirmDestructive) {
+      const trimmed = queryToRun.trim();
+      const isDestructive =
+        /^\s*DROP\s+(TABLE|DATABASE|SCHEMA|VIEW)\b/i.test(trimmed) ||
+        /^\s*TRUNCATE\s+(TABLE)?\b/i.test(trimmed) ||
+        (/^\s*DELETE\s+FROM\b/i.test(trimmed) && !/\bWHERE\b/i.test(trimmed));
+
+      if (isDestructive) {
+        const preview = trimmed.length > 120 ? trimmed.substring(0, 120) + '...' : trimmed;
+        const confirmed = window.confirm(
+          `⚠️ Destructive Query Warning:\n\n` +
+          `You are about to execute a potentially destructive query:\n"${preview}"\n\n` +
+          `Are you sure you want to proceed with execution?`
+        );
+        if (!confirmed) {
+          return;
+        }
+      }
+    }
+
     setEditingCell(null);
     setLastExecutedQuery(queryToRun);
     setIsRunning(true);
@@ -514,9 +542,9 @@ export function SqlEditorView({
     }
   };
 
-  // Keyboard shortcut Ctrl+Enter or Cmd+Enter
+  // Keyboard shortcut (default Ctrl+Enter or custom run_query shortcut)
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    if (isShortcutMatch(e.nativeEvent, runQueryShortcut || 'Ctrl+Enter')) {
       e.preventDefault();
       handleExecute();
       return;
@@ -663,12 +691,12 @@ export function SqlEditorView({
             disabled={isRunning}
             className={cn(
               "flex items-center gap-1.5 h-7 px-3 text-xs font-semibold shadow-sm transition-all",
-              selectedText && "bg-yellow-400 text-zinc-950 ring-2 ring-yellow-400/40"
+              selectedText && "bg-yellow-400 text-slate-950 font-bold ring-2 ring-yellow-400/40"
             )}
-            title={selectedText ? `Run selected query (${selectedText.length} chars) - Ctrl+Enter` : "Run query - Ctrl+Enter"}
+            title={selectedText ? `Run selected query (${selectedText.length} chars) - ${runQueryShortcut || 'Ctrl+Enter'}` : `Run query - ${runQueryShortcut || 'Ctrl+Enter'}`}
           >
             <Play className={cn('w-3 h-3 fill-current', isRunning && 'animate-spin')} />
-            <span>{isRunning ? 'Running...' : selectedText ? 'Run Selection (Ctrl+Enter)' : 'Run (Ctrl+Enter)'}</span>
+            <span>{isRunning ? 'Running...' : selectedText ? `Run Selection (${runQueryShortcut || 'Ctrl+Enter'})` : `Run (${runQueryShortcut || 'Ctrl+Enter'})`}</span>
           </Button>
 
           {selectedText && (
@@ -759,7 +787,8 @@ export function SqlEditorView({
         {/* Line Numbers Column */}
         <div
           ref={lineNumbersRef}
-          className="w-10 bg-zinc-900/60 border-r border-zinc-800/80 text-zinc-600 select-none py-2 text-right pr-2 text-[11px] leading-5 shrink-0 overflow-hidden"
+          style={{ fontSize: `${Math.max(10, fontSize - 2)}px`, lineHeight: `${Math.round(fontSize * 1.5)}px` }}
+          className="w-10 bg-zinc-900/60 border-r border-zinc-800/80 text-zinc-600 select-none py-2 text-right pr-2 shrink-0 overflow-hidden"
         >
           {Array.from({ length: lineCount }).map((_, i) => (
             <div key={i}>{i + 1}</div>
@@ -772,7 +801,8 @@ export function SqlEditorView({
           <pre
             ref={highlightRef}
             aria-hidden="true"
-            className="w-full h-full p-2 bg-transparent font-mono text-xs leading-5 whitespace-pre-wrap break-all pointer-events-none select-none overflow-hidden absolute inset-0 z-0"
+            style={{ fontSize: `${fontSize}px`, lineHeight: `${Math.round(fontSize * 1.5)}px` }}
+            className="w-full h-full p-2 bg-transparent font-mono whitespace-pre-wrap break-all pointer-events-none select-none overflow-hidden absolute inset-0 z-0"
           >
             <code>{highlightSql(query)}{query.endsWith('\n') ? ' ' : ''}</code>
           </pre>
@@ -789,7 +819,8 @@ export function SqlEditorView({
             onMouseUp={handleSelectionChange}
             placeholder="-- Write your SQL query here (e.g. SELECT * FROM table_name LIMIT 50;)"
             spellCheck={false}
-            className="w-full h-full p-2 bg-transparent text-transparent caret-yellow-400 placeholder:text-zinc-600 focus:outline-none resize-none leading-5 font-mono text-xs select-text overflow-auto absolute inset-0 z-10 selection:bg-yellow-400/30 selection:text-white"
+            style={{ fontSize: `${fontSize}px`, lineHeight: `${Math.round(fontSize * 1.5)}px` }}
+            className="w-full h-full p-2 bg-transparent text-transparent caret-yellow-400 placeholder:text-zinc-600 focus:outline-none resize-none font-mono select-text overflow-auto absolute inset-0 z-10 selection:bg-yellow-400/30 selection:text-white"
           />
 
           {/* SQL Autocomplete Popup Menu */}
@@ -943,7 +974,10 @@ export function SqlEditorView({
 
           {/* Successful Tabular Grid Result */}
           {result && result.success && result.rows && result.rows.length > 0 && (
-            <div className="flex-1 min-h-0 min-w-0 overflow-auto font-mono text-xs">
+            <div
+              className="flex-1 min-h-0 min-w-0 overflow-auto font-mono"
+              style={{ fontSize: `${fontSize}px` }}
+            >
               <table className="min-w-full w-max border-collapse select-text">
                 <thead className="sticky top-0 z-10 bg-zinc-900 border-b border-zinc-800">
                   <tr>

@@ -17,6 +17,8 @@ interface DataTableViewProps {
   tableName: string;
   autocommit?: boolean;
   inTransaction?: boolean;
+  fontSize?: number;
+  defaultQueryLimit?: number;
   onTransactionChange?: (inTx: boolean) => void;
   onRefreshHistory?: () => void;
   onDisconnect?: () => void;
@@ -31,6 +33,8 @@ export function DataTableView({
   tableName,
   autocommit = true,
   inTransaction = false,
+  fontSize = 13,
+  defaultQueryLimit = 50,
   onTransactionChange,
   onRefreshHistory,
   onDisconnect,
@@ -45,7 +49,14 @@ export function DataTableView({
 
   // Pagination
   const [page, setPage] = useState(1);
-  const [limit] = useState(50);
+  const [limit, setLimit] = useState(defaultQueryLimit || 50);
+
+  useEffect(() => {
+    if (defaultQueryLimit && defaultQueryLimit !== limit) {
+      setLimit(defaultQueryLimit);
+      setPage(1);
+    }
+  }, [defaultQueryLimit]);
   const [lastFetchedTime, setLastFetchedTime] = useState<Date>(new Date());
   const [relativeTimeText, setRelativeTimeText] = useState('Just now');
 
@@ -735,7 +746,10 @@ export function DataTableView({
       {/* =========================================================================
           DATA GRID (Signature Beekeeper Yellow Outline + Inline Cell Editing)
       ========================================================================== */}
-      <div className="flex-1 min-h-0 min-w-0 overflow-auto bg-zinc-950 font-mono text-xs relative">
+      <div 
+        className="flex-1 min-h-0 min-w-0 overflow-auto bg-zinc-950 font-mono relative"
+        style={{ fontSize: `${fontSize || 13}px` }}
+      >
         <table className="min-w-full w-max border-collapse select-text">
           {/* Header Row */}
           <thead className="sticky top-0 z-20 bg-zinc-900 border-b border-zinc-800 shadow-sm">
