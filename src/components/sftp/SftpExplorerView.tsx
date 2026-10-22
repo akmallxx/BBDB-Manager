@@ -474,9 +474,11 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
         loadLocalDirectory(localCurrentPath);
       }
     } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        showToast(err.message || 'Transfer failed', 'error');
+      if (err.name === 'AbortError') {
+        // Abort handling is either managed by handleCancelTransfer or component unmount.
+        return;
       }
+      showToast(err.message || 'Transfer failed', 'error');
       if (direction === 'to-remote') loadDirectory(currentPath);
       else loadLocalDirectory(localCurrentPath);
     } finally {
@@ -490,6 +492,34 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
 
   const handleTransferToRemote = (paths?: string[]) => executeTransfer('to-remote', paths);
   const handleTransferToLocal = (paths?: string[]) => executeTransfer('to-local', paths);
+
+  const handleCancelTransfer = useCallback(() => {
+    if (transferAbortControllerRef.current) {
+      transferAbortControllerRef.current.abort();
+      transferAbortControllerRef.current = null;
+    }
+    setIsTransferring(false);
+    setTransferProgress(null);
+    showToast('Transfer cancelled by user', 'info');
+    loadDirectory(currentPath);
+    if (isDualPane) loadLocalDirectory(localCurrentPath);
+  }, [currentPath, isDualPane, localCurrentPath, loadDirectory, loadLocalDirectory]);
+
+  // Escape key cancels active transfer when no modal or text input is focused
+  useEffect(() => {
+    if (!isTransferring) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const isInputFocused =
+        document.activeElement instanceof HTMLInputElement ||
+        document.activeElement instanceof HTMLTextAreaElement;
+      if (e.key === 'Escape' && !promptModal && !editorFile && !isInputFocused) {
+        e.preventDefault();
+        handleCancelTransfer();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isTransferring, promptModal, editorFile, handleCancelTransfer]);
 
   // --- File Editor ---
   const handleOpenFile = async (item: SftpFileItem, target: 'local' | 'remote') => {
@@ -1584,8 +1614,8 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
               </div>
             </div>
 
-            {/* Percentage badge */}
-            <div className="flex items-center gap-1.5 shrink-0">
+            {/* Percentage badge & Cancel button */}
+            <div className="flex items-center gap-2 shrink-0">
               <span
                 className={cn(
                   'text-xs font-bold font-mono tracking-tight',
@@ -1594,6 +1624,16 @@ export const SftpExplorerView: React.FC<SftpExplorerViewProps> = ({
               >
                 {transferProgress.totalBytes > 0 ? `${transferProgress.percent}%` : 'Transferring...'}
               </span>
+
+              <button
+                type="button"
+                onClick={handleCancelTransfer}
+                title="Cancel transfer (Esc)"
+                className="flex items-center justify-center w-6 h-6 rounded-md text-zinc-400 hover:text-rose-400 hover:bg-rose-500/15 border border-transparent hover:border-rose-500/30 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-rose-500 transition-all cursor-pointer"
+                aria-label="Cancel transfer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 

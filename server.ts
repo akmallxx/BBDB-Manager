@@ -1939,6 +1939,25 @@ app.post('/api/sftp/transfer', async (req, res) => {
     const transferred: string[] = [];
     const errors: string[] = [];
     const totalItems = sourcePaths.length;
+    let isAborted = false;
+    let currentLocalTargetFile: string | null = null;
+
+    req.on('close', () => {
+      if (!res.writableEnded) {
+        isAborted = true;
+        console.log('[SFTP Transfer] Client connection closed or cancelled by user.');
+        closeSftpSession(sessionKey);
+        if (currentLocalTargetFile && fs.existsSync(currentLocalTargetFile)) {
+          try {
+            const stat = fs.statSync(currentLocalTargetFile);
+            if (stat.isFile()) {
+              fs.unlinkSync(currentLocalTargetFile);
+              console.log(`[SFTP Transfer] Cleaned up partial local file: ${currentLocalTargetFile}`);
+            }
+          } catch {}
+        }
+      }
+    });
 
     sendEvent({
       type: 'start',
@@ -1949,13 +1968,16 @@ app.post('/api/sftp/transfer', async (req, res) => {
     await withSftpSession(sessionKey, config, async (sftp) => {
       let itemIndex = 0;
       for (const src of sourcePaths) {
-        if (req.destroyed || res.destroyed) {
+        if (isAborted || req.destroyed || res.destroyed) {
           console.log('[SFTP Transfer Aborted by client]');
           break;
         }
 
         itemIndex++;
         const fileName = path.basename(src);
+        if (direction === 'to-local') {
+          currentLocalTargetFile = path.join(targetDir, fileName);
+        }
 
         sendEvent({
           type: 'item_start',
@@ -1985,6 +2007,7 @@ app.post('/api/sftp/transfer', async (req, res) => {
             await transferRemoteItemToLocal(sftp, src, targetDir, onProgress);
           }
           transferred.push(src);
+          currentLocalTargetFile = null;
           sendEvent({
             type: 'item_done',
             direction,
@@ -1993,6 +2016,18 @@ app.post('/api/sftp/transfer', async (req, res) => {
             totalItems
           });
         } catch (itemErr: any) {
+          if (isAborted || req.destroyed || res.destroyed) {
+            console.log(`[SFTP Transfer Aborted during ${fileName}]`);
+            if (direction === 'to-local' && currentLocalTargetFile && fs.existsSync(currentLocalTargetFile)) {
+              try {
+                const stat = fs.statSync(currentLocalTargetFile);
+                if (stat.isFile()) {
+                  fs.unlinkSync(currentLocalTargetFile);
+                }
+              } catch {}
+            }
+            break;
+          }
           console.error(`[SFTP Transfer Error on ${src}]`, itemErr);
           errors.push(`${fileName}: ${itemErr.message}`);
           sendEvent({
@@ -2006,6 +2041,14 @@ app.post('/api/sftp/transfer', async (req, res) => {
         }
       }
     });
+
+    if (isAborted || req.destroyed || res.destroyed) {
+      closeSftpSession(sessionKey);
+      if (!res.writableEnded && !res.destroyed) {
+        res.end();
+      }
+      return;
+    }
 
     const result = {
       success: errors.length === 0,

@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Live transfer speed calculation (e.g. `38.4 MB/s`) measured over rolling 300ms windows.
   - Server-Sent Events (SSE) streaming protocol via `/api/sftp/transfer` for zero-lag progress updates.
   - Full client disconnect protection, reader lock cleanup, and `AbortController` integration on component unmount.
+- **Instant Transfer Cancellation (Abort)**:
+  - Interactive Cancel button (`X`) directly inside the floating transfer banner and global `Escape` keyboard shortcut.
+  - Instant abort mechanism leveraging `AbortController` and server-side socket disconnect detection (`req.on('close')`).
+  - Automatic SFTP channel termination (`closeSftpSession`) stopping in-flight `fastGet`/`fastPut` pipelines in milliseconds.
+  - Automatic cleanup of incomplete/corrupt local files upon cancelled downloads.
 - **High-Speed Parallel SFTP Engine**:
   - Replaced sequential single-stream transfer with `ssh2` pipelined `fastGet` and `fastPut` algorithms using 64 concurrent chunk pipelines.
   - Uncapped HTTP socket timeouts for multi-gigabyte database dumps and archive files.
